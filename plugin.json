@@ -1,0 +1,19 @@
+{
+  "id": "staffview",
+  "name": "Staff View",
+  "version": "0.2.0",
+  "private": false,
+  "description": "Standard notation (grand staff) viewer for arrangements with sloppak notation data, rendered via alphaTab.",
+  "type": "visualization",
+  "script": "screen.js",
+  "standards": ["capability-pipelines.v1", "plugin-runtime-idempotent.v1"],
+  "capabilities": {
+    "visualization": {
+      "roles": ["provider"],
+      "operations": ["renderer.create", "renderer.destroy"],
+      "emits": ["renderer-ready", "renderer-failed"],
+      "mode": "active",
+      "safety": "safe"
+    }
+  }
+}
