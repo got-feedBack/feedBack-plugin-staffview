@@ -1,6 +1,6 @@
 # slopsmith-plugin-staffview
 
-Standard notation viewer for [Slopsmith](https://github.com/got-feedback/feedback).
+Standard notation viewer for [Slopsmith](https://github.com/got-feedback/feedBack).
 
 Renders musical notation (treble/bass clef, grand staff, etc.) for any
 arrangement that carries notation data in the sloppak format, using
