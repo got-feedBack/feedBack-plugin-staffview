@@ -6,14 +6,27 @@
   "description": "Standard notation (grand staff) viewer for arrangements with sloppak notation data, rendered via alphaTab.",
   "type": "visualization",
   "script": "screen.js",
-  "standards": ["capability-pipelines.v1", "plugin-runtime-idempotent.v1"],
+  "standards": [
+    "capability-pipelines.v1",
+    "plugin-runtime-idempotent.v1"
+  ],
   "capabilities": {
     "visualization": {
-      "roles": ["provider"],
-      "operations": ["renderer.create", "renderer.destroy"],
-      "emits": ["renderer-ready", "renderer-failed"],
+      "roles": [
+        "provider"
+      ],
+      "operations": [
+        "renderer.create",
+        "renderer.destroy"
+      ],
+      "emits": [
+        "renderer-ready",
+        "renderer-failed"
+      ],
       "mode": "active",
       "safety": "safe"
     }
-  }
+  },
+  "category": "creation",
+  "icon": "assets/thumb.svg"
 }
