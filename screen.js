@@ -1730,6 +1730,8 @@ function createFactory() {
 // ═══════════════════════════════════════════════════════════════════════
 
 window.slopsmithViz_staffview = createFactory;
+// slopsmith→feedBack rename: host viz picker looks up `window.feedBackViz_<id>`.
+window.feedBackViz_staffview = window.slopsmithViz_staffview;
 
 // Auto-activates when the active arrangement carries notation data.
 // songInfo.has_notation is set by server.py from LoadedSloppak.notation_by_id.
