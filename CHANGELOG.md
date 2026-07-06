@@ -8,6 +8,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- **alphaSynth playback** — AlphaTab playback is scrapped in favour of
+  OGG-only playback: the host owns audio, matching tabview's rationale
+  (`enablePlayer: false` drops the soundfont CDN download and the
+  player-ready dependency). Removes the `♩ Staffview` pill with the
+  Playback checkbox + `[⏮] [▶/⏸] [⏹]` transport, the OGG/alphaSynth
+  mutual-exclusion bridge, the `playerPositionChanged` cursor path
+  (the marker is now always driven by the `bundle.beats` stream), and
+  the v3 slot retry/observer machinery that existed only for the pill.
+
+### Fixed
+
+- **Click-to-seek uses the `bundle.beats` time stream** — the clicked
+  beat's tick is now converted to seconds by inverting the cursor-sync
+  mapping (`tick = (beatIndex + frac) * 960`) against the host's beat
+  timestamps, instead of a single-BPM approximation that landed on the
+  wrong position in any tempo-varying song. The BPM path remains only as
+  a fallback while beat data hasn't arrived yet.
+- **Empty measures render a whole rest** — the empty-voice filler beat no
+  longer sets `isEmpty = true`, which told alphaTab to skip the glyph
+  entirely and left the measure blank. With no notes added alphaTab derives
+  `isRest` from `notes.length === 0` and draws the whole-rest glyph.
+
 ### Changed
 
 - **Migrated to the `window.feedBack` namespace** — the host bus
@@ -28,11 +52,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **License** — relicensed MIT → AGPL-3.0-only per the curated-plugin
   licensing policy (CONTRIBUTING.md); attribution to the original author
   (Gionni) kept in the README.
-- **v3 UI support** — the `♩ Staffview` pill now mounts into
-  `window.slopsmith.ui.playerControlSlot()` when
-  `window.slopsmith.uiVersion === 'v3'` (the v2 `#player-footer` path is
-  unchanged), and the score container insets no longer assume the v2
-  HUD/controls heights when those elements are absent in v3.
+- **v3 UI support** — the score container insets no longer assume the v2
+  HUD/controls heights when those elements are `position:absolute` overlays
+  in v3 (`window.slopsmith.uiVersion === 'v3'`).
 
 ---
 
