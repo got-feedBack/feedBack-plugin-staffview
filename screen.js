@@ -355,11 +355,15 @@ function _buildScore(at, info, measures) {
                 }
 
                 // Empty voice → whole rest so the measure isn't blank.
+                // NB: isEmpty must stay false — isEmpty=true tells alphaTab to
+                // skip the beat entirely (no glyph), which is exactly the
+                // "rests not rendering" bug this guards against. With no notes
+                // added alphaTab derives isRest from notes.length === 0 and
+                // draws the whole-rest glyph.
                 if (voice.beats.length === 0) {
                     const rest    = new m.Beat();
                     rest.voice    = voice;
                     rest.duration = m.Duration ? m.Duration.Whole : 1;
-                    rest.isEmpty  = true;
                     voice.addBeat(rest);
                 }
 

@@ -19,6 +19,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (the marker is now always driven by the `bundle.beats` stream), and
   the v3 slot retry/observer machinery that existed only for the pill.
 
+### Fixed
+
+- **Empty measures render a whole rest** — the empty-voice filler beat no
+  longer sets `isEmpty = true`, which told alphaTab to skip the glyph
+  entirely and left the measure blank. With no notes added alphaTab derives
+  `isRest` from `notes.length === 0` and draws the whole-rest glyph.
+
 ### Changed
 
 - **Migrated to the `window.feedBack` namespace** — the host bus
