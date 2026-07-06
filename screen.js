@@ -10,7 +10,7 @@
 //   - Builds alphaTab.model.Score directly in JS from the accumulated data,
 //     calls score.finish(), then api.renderScore(score)
 //   - boundsLookup-driven playback marker (same pattern as tabview slopsmith#734)
-//   - alphaSynth player enabled; bridges slopsmith song:play/pause/stop/seek
+//   - alphaSynth player enabled; bridges feedBack song:play/pause/stop/seek
 //     events to alphaTab's transport so the global play button drives the score
 //   - Cursor sync: playerPositionChanged (currentTick) when alphaSynth is
 //     playing; falls back to bundle.beats → tick lookup otherwise (Scenario 3)
@@ -90,14 +90,14 @@ function _loadAlphaTab() {
     }
 
     if (
-        window.slopsmith &&
-        typeof window.slopsmith.on === 'function' &&
-        !window.__slopsmithStaffviewArrangementSubscribed
+        window.feedBack &&
+        typeof window.feedBack.on === 'function' &&
+        !window.__feedBackStaffviewArrangementSubscribed
     ) {
-        window.slopsmith.on('arrangement:changed', (e) => {
+        window.feedBack.on('arrangement:changed', (e) => {
             if (e && e.detail && e.detail.filename) _svFilename = e.detail.filename;
         });
-        window.__slopsmithStaffviewArrangementSubscribed = true;
+        window.__feedBackStaffviewArrangementSubscribed = true;
     }
 })();
 
@@ -105,15 +105,20 @@ function _loadAlphaTab() {
 // Splitscreen helpers (mirrors tabview — only panelChromeFor needed)
 // ═══════════════════════════════════════════════════════════════════════
 
+// The published splitscreen plugin currently exports only the pre-rename
+// window.slopsmithSplitscreen global (core's highway_3d reads
+// window.feedBackSplitscreen instead, which nothing defines) — read both,
+// preferring the current name, so staffview keeps working with whichever
+// splitscreen build is installed.
 function _ssActive() {
-    const ss = window.slopsmithSplitscreen;
+    const ss = window.feedBackSplitscreen || window.slopsmithSplitscreen;
     if (!ss || typeof ss.isActive !== 'function' || !ss.isActive()) return false;
     return typeof ss.panelChromeFor === 'function';
 }
 
 function _resolveMount(canvas) {
     if (_ssActive()) {
-        const ss = window.slopsmithSplitscreen;
+        const ss = window.feedBackSplitscreen || window.slopsmithSplitscreen;
         return ss.panelChromeFor(canvas);
     }
     return document.getElementById('player');
@@ -123,14 +128,14 @@ function _resolveMount(canvas) {
 // must mount into the stable plugin-control slot instead of the auto-hiding
 // transport / footer. Returns null on v2 so callers fall back unchanged.
 function _isV3() {
-    return !!(window.slopsmith && window.slopsmith.uiVersion === 'v3');
+    return !!(window.feedBack && window.feedBack.uiVersion === 'v3');
 }
 
 function _playerSlot() {
     return (_isV3()
-        && window.slopsmith.ui
-        && typeof window.slopsmith.ui.playerControlSlot === 'function')
-        ? window.slopsmith.ui.playerControlSlot() : null;
+        && window.feedBack.ui
+        && typeof window.feedBack.ui.playerControlSlot === 'function')
+        ? window.feedBack.ui.playerControlSlot() : null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -451,7 +456,7 @@ function createFactory() {
     // _svPlayerTick: last tick received from playerPositionChanged; -1
     // means alphaTab's clock is not driving the cursor (use bundle.beats).
     // _svSongEventHandlers: {play, pause, stop, seek} bound handlers
-    // registered on window.slopsmith; removed in _svTeardown.
+    // registered on window.feedBack; removed in _svTeardown.
     let _svSoundFontReady    = false;
     let _svPlayerTick        = -1;   // -1 = alphaSynth not in control
     let _svSongEventHandlers = null;
@@ -1127,7 +1132,7 @@ function createFactory() {
             audio.pause();
             _svOggPausedByUs = true;
         }
-        // Install the bridge so that if the user later hits the slopsmith
+        // Install the bridge so that if the user later hits the feedBack
         // play button, alphaSynth yields back to OGG.
         _svInstallSongBridge(_svInitToken);
         // Start alphaSynth.
@@ -1177,7 +1182,7 @@ function createFactory() {
     // Installed only while alphaSynth is playing (i.e. after the user
     // hits ▶ in the popover). Listens for two events:
     //
-    //   OGG 'play'   → the user hit the slopsmith play button while
+    //   OGG 'play'   → the user hit the feedBack play button while
     //                  alphaSynth was running; yield — pause alphaSynth
     //                  and let OGG take over.
     //   song:stop    → song switch / teardown; stop alphaSynth entirely.
@@ -1213,8 +1218,8 @@ function createFactory() {
         };
 
         audio.addEventListener('play', onAudioPlay);
-        if (window.slopsmith && typeof window.slopsmith.on === 'function') {
-            window.slopsmith.on('song:stop', onStop);
+        if (window.feedBack && typeof window.feedBack.on === 'function') {
+            window.feedBack.on('song:stop', onStop);
         }
 
         _svSongEventHandlers = { onAudioPlay, onStop, audio };
@@ -1226,8 +1231,8 @@ function createFactory() {
         if (h.audio) {
             h.audio.removeEventListener('play', h.onAudioPlay);
         }
-        if (window.slopsmith && typeof window.slopsmith.off === 'function') {
-            window.slopsmith.off('song:stop', h.onStop);
+        if (window.feedBack && typeof window.feedBack.off === 'function') {
+            window.feedBack.off('song:stop', h.onStop);
         }
         _svSongEventHandlers = null;
     }
@@ -1729,13 +1734,14 @@ function createFactory() {
 // Register factory + auto-match predicate
 // ═══════════════════════════════════════════════════════════════════════
 
-window.slopsmithViz_staffview = createFactory;
-// slopsmith→feedBack rename: host viz picker looks up `window.feedBackViz_<id>`.
-window.feedBackViz_staffview = window.slopsmithViz_staffview;
+// The viz picker looks up window.feedBackViz_<id> — no other name is
+// consumed anywhere in core or in other plugins, so this is the sole
+// registration (the old slopsmithViz_staffview name has been dropped).
+window.feedBackViz_staffview = createFactory;
 
 // Auto-activates when the active arrangement carries notation data.
 // songInfo.has_notation is set by server.py from LoadedSloppak.notation_by_id.
-window.slopsmithViz_staffview.matchesArrangement = function (songInfo) {
+window.feedBackViz_staffview.matchesArrangement = function (songInfo) {
     return !!(songInfo && songInfo.has_notation);
 };
 
