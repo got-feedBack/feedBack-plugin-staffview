@@ -8,6 +8,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- **alphaSynth playback** — AlphaTab playback is scrapped in favour of
+  OGG-only playback: the host owns audio, matching tabview's rationale
+  (`enablePlayer: false` drops the soundfont CDN download and the
+  player-ready dependency). Removes the `♩ Staffview` pill with the
+  Playback checkbox + `[⏮] [▶/⏸] [⏹]` transport, the OGG/alphaSynth
+  mutual-exclusion bridge, the `playerPositionChanged` cursor path
+  (the marker is now always driven by the `bundle.beats` stream), and
+  the v3 slot retry/observer machinery that existed only for the pill.
+
 ### Changed
 
 - **Migrated to the `window.feedBack` namespace** — the host bus
@@ -28,11 +39,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **License** — relicensed MIT → AGPL-3.0-only per the curated-plugin
   licensing policy (CONTRIBUTING.md); attribution to the original author
   (Gionni) kept in the README.
-- **v3 UI support** — the `♩ Staffview` pill now mounts into
-  `window.slopsmith.ui.playerControlSlot()` when
-  `window.slopsmith.uiVersion === 'v3'` (the v2 `#player-footer` path is
-  unchanged), and the score container insets no longer assume the v2
-  HUD/controls heights when those elements are absent in v3.
+- **v3 UI support** — the score container insets no longer assume the v2
+  HUD/controls heights when those elements are `position:absolute` overlays
+  in v3 (`window.slopsmith.uiVersion === 'v3'`).
 
 ---
 

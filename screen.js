@@ -10,10 +10,9 @@
 //   - Builds alphaTab.model.Score directly in JS from the accumulated data,
 //     calls score.finish(), then api.renderScore(score)
 //   - boundsLookup-driven playback marker (same pattern as tabview slopsmith#734)
-//   - alphaSynth player enabled; bridges feedBack song:play/pause/stop/seek
-//     events to alphaTab's transport so the global play button drives the score
-//   - Cursor sync: playerPositionChanged (currentTick) when alphaSynth is
-//     playing; falls back to bundle.beats → tick lookup otherwise (Scenario 3)
+//   - No alphaTab synth: the host owns audio (OGG). enablePlayer:false drops
+//     the soundfont CDN download entirely, same rationale as tabview.
+//   - Cursor sync: bundle.beats → tick lookup drives the marker
 //
 // Module-scope singletons:
 //   - alphaTab CDN load promise (one <script> per page)
@@ -124,18 +123,11 @@ function _resolveMount(canvas) {
     return document.getElementById('player');
 }
 
-// v3 player chrome (docs/plugin-v3-ui.md): controls injected into the player
-// must mount into the stable plugin-control slot instead of the auto-hiding
-// transport / footer. Returns null on v2 so callers fall back unchanged.
+// v3 player chrome (docs/plugin-v3-ui.md): v3's #player-hud / #player-controls
+// are position:absolute overlays that consume no layout space, so container
+// sizing must not subtract their heights (see _svSizeContainer).
 function _isV3() {
     return !!(window.feedBack && window.feedBack.uiVersion === 'v3');
-}
-
-function _playerSlot() {
-    return (_isV3()
-        && window.feedBack.ui
-        && typeof window.feedBack.ui.playerControlSlot === 'function')
-        ? window.feedBack.ui.playerControlSlot() : null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -450,40 +442,6 @@ function createFactory() {
     let _svLastTick     = -1;
     let _svLatestBeats  = null; // bundle.beats snapshot
 
-    // ── alphaSynth player state ────────────────────────────────────
-    // _svSoundFontReady: true once soundFontLoaded has fired — api.play()
-    // is only valid after this point.
-    // _svPlayerTick: last tick received from playerPositionChanged; -1
-    // means alphaTab's clock is not driving the cursor (use bundle.beats).
-    // _svSongEventHandlers: {play, pause, stop, seek} bound handlers
-    // registered on window.feedBack; removed in _svTeardown.
-    let _svSoundFontReady    = false;
-    let _svPlayerTick        = -1;   // -1 = alphaSynth not in control
-    let _svSongEventHandlers = null;
-
-    // ── Playback mode UI state ─────────────────────────────────────
-    // _svPlaybackOn: whether the Playback checkbox is ticked (controls visible).
-    // Default false. Resets on each new song (init).
-    // _svPillWrap: the wrapper element appended to #player-footer (main)
-    // or panelDiv (splitscreen). Removed in _svRemoveContainer().
-    // _svPendingPlay: play was requested before soundFontLoaded fired;
-    // execute it as soon as the soundfont is ready.
-    // _svPlayBtn / _svStopBtn: transport button elements inside the popover;
-    // updated by _svUpdatePlayBtn().
-    // _svOggPausedByUs: true if we called audio.pause() to make way for
-    // alphaSynth — used to decide whether to restore OGG on stop/pause.
-    let _svPlaybackOn      = false;
-    let _svPillWrap        = null;
-    let _svPillRetryTimer  = null;
-    let _svPillRetries     = 0;
-    const _SV_PILL_MAX_RETRIES = 20;   // ~5 s of 250 ms polls for the v3 slot
-    let _svSlotObserver    = null;     // MutationObserver fallback when polls exhaust
-    let _svPendingPlay     = false;
-    let _svPlayBtn         = null;
-    let _svStopBtn         = null;
-    let _svOggPausedByUs   = false;
-    let _svSynthPlaying    = false;  // intent flag: true = we asked alphaSynth to play
-
     // ── Window resize ref ──────────────────────────────────────────
     const _onWinResize = () => _svSizeContainer();
 
@@ -554,8 +512,8 @@ function createFactory() {
 
         // ── Click-to-seek ─────────────────────────────────────────
         // mousedown on the score div: resolve the clicked position to a
-        // beat tick via boundsLookup.getBeatAtPos(), then seek both
-        // alphaSynth (tickPosition) and the OGG audio element (currentTime).
+        // beat tick via boundsLookup.getBeatAtPos(), then seek the OGG
+        // audio element (currentTime).
         inner.addEventListener('mousedown', (e) => {
             if (!_svApi || !_svApiReady) return;
             const bl = _svApi.boundsLookup;
@@ -582,21 +540,16 @@ function createFactory() {
             _svLastBeat = beat;
             _svUpdateMarker();
 
-            if (_svPlaybackOn && _svApi && _svSoundFontReady) {
-                // Seek alphaSynth.
-                try { _svApi.tickPosition = tick; } catch (_) {}
-            } else {
-                // Seek the OGG audio element using the bundle.beats map.
-                // Convert tick back to seconds: secs = tick / (BPM/60 * 960).
-                // Use the score tempo as approximation.
-                try {
-                    const score = _svApi && _svApi.score;
-                    const bpm   = (score && score.tempo) ? score.tempo : 120;
-                    const secs  = tick / ((bpm / 60) * 960);
-                    const audio = document.getElementById('audio');
-                    if (audio) audio.currentTime = secs;
-                } catch (_) {}
-            }
+            // Seek the OGG audio element using the bundle.beats map.
+            // Convert tick back to seconds: secs = tick / (BPM/60 * 960).
+            // Use the score tempo as approximation.
+            try {
+                const score = _svApi && _svApi.score;
+                const bpm   = (score && score.tempo) ? score.tempo : 120;
+                const secs  = tick / ((bpm / 60) * 960);
+                const audio = document.getElementById('audio');
+                if (audio) audio.currentTime = secs;
+            } catch (_) {}
         });
 
         // ResizeObserver on controls bar so bottom inset stays correct
@@ -608,8 +561,6 @@ function createFactory() {
                 _svControlsObserver.observe(controls);
             }
         }
-
-        _svCreatePill();
 
         return c;
     }
@@ -645,7 +596,6 @@ function createFactory() {
             try { _svControlsObserver.disconnect(); } catch (_) {}
             _svControlsObserver = null;
         }
-        _svRemovePill();
         if (_svContainer) {
             if (_svPrevMountPos !== null) {
                 const mount = _svContainer.parentElement;
@@ -656,327 +606,6 @@ function createFactory() {
             _svContainer = null;
             _svAtMount   = null;
             _svMarker    = null;
-        }
-    }
-
-    // ── Playback mode pill ─────────────────────────────────────────
-    // A small pill button + popover injected into #player-footer (main
-    // player) or the splitscreen panelDiv (splitscreen), letting the user
-    // switch between OGG audio (default) and alphaSynth playback.
-    //
-    // Own CSS class names (sv-pill, sv-pill--active, sv-popover) are used
-    // instead of section-practice-pill to avoid semantic confusion and
-    // future coexistence issues with the practice pill.
-    //
-    // Pill anchor:
-    //   Main player  → document.getElementById('player-footer')
-    //   Splitscreen  → _resolveMount (the panelDiv, position:relative)
-    //                  pill wrapper gets position:absolute; bottom:0; left:8px
-    //                  so it sits at panel bottom-left alongside the bar toggle
-
-    function _svCreatePill() {
-        if (_svPillWrap) return;
-
-        const inSS     = _ssActive();
-        // v3: mount into the stable plugin-control slot (the "Plugins" rail
-        // popover) — #player-footer belongs to the v2 chrome and the v3
-        // transport auto-hides (docs/plugin-v3-ui.md). v2 path unchanged.
-        const slot     = inSS ? null : _playerSlot();
-        // v3: never fall back to #player-footer — that element belongs to the
-        // v2 chrome and auto-hides in v3. If the slot isn't ready yet the
-        // retry path below will keep trying. v2 falls back normally.
-        const footer   = inSS ? _resolveMount(_svHighwayCanvas)
-                              : (_isV3() ? slot : (slot || document.getElementById('player-footer')));
-        if (!footer) {
-            // v3 mounts the pill into the plugin-control slot, which the rail
-            // popover may not have created yet on the first call. Without a
-            // retry the pill would be permanently missing for the session.
-            // Fast path: poll a bounded number of times (covers the common
-            // case where the v3 slot appears within a few seconds of startup).
-            // Fallback: if polls exhaust (slot lazily created, e.g. after user
-            // first opens the plugin rail), arm a MutationObserver on
-            // document.body that fires _svCreatePill exactly once when the
-            // slot element arrives in the DOM. Splitscreen and v2 have no
-            // late-slot problem so they fall through to the single attempt.
-            if (!inSS && _isV3()) {
-                if (_svPillRetries < _SV_PILL_MAX_RETRIES) {
-                    _svPillRetries += 1;
-                    _svPillRetryTimer = setTimeout(_svCreatePill, 250);
-                } else if (!_svSlotObserver) {
-                    _svSlotObserver = new MutationObserver(function () {
-                        if (_svPillWrap || !_playerSlot()) return;
-                        _svSlotObserver.disconnect();
-                        _svSlotObserver = null;
-                        _svCreatePill();
-                    });
-                    _svSlotObserver.observe(document.body, { childList: true, subtree: true });
-                }
-            }
-            return;
-        }
-        if (_svPillRetryTimer) { clearTimeout(_svPillRetryTimer); _svPillRetryTimer = null; }
-        if (_svSlotObserver)   { _svSlotObserver.disconnect(); _svSlotObserver = null; }
-
-        // ── Wrapper (position:relative — popover anchors off it) ──
-        // In splitscreen the wrapper is absolute so it can sit at the
-        // bottom-left of the panelDiv without disturbing panel layout.
-        const wrap = document.createElement('div');
-        wrap.id = 'sv-pill-wrap-' + _instanceId;
-        if (inSS) {
-            wrap.style.cssText = [
-                'position:absolute',
-                'bottom:0',
-                'left:8px',
-                'z-index:7',
-                'display:inline-flex',
-                'align-items:center',
-                'padding:4px 8px',
-            ].join(';');
-        } else {
-            wrap.style.cssText = [
-                'position:relative',
-                'display:inline-flex',
-                'align-items:center',
-                'padding:4px 8px',
-            ].join(';');
-        }
-
-        // ── Pill button ───────────────────────────────────────────
-        const pill = document.createElement('button');
-        pill.type = 'button';
-        pill.id   = 'sv-pill-' + _instanceId;
-        pill.setAttribute('aria-haspopup', 'dialog');
-        pill.setAttribute('aria-expanded', 'false');
-        pill.setAttribute('aria-label', 'Staffview options');
-        pill.title = 'Staffview';
-        pill.style.cssText = [
-            'display:inline-flex',
-            'align-items:center',
-            'gap:5px',
-            'padding:4px 10px',
-            'border-radius:9999px',
-            'font-size:12px',
-            'font-weight:600',
-            'color:#cbd5e1',
-            'background:#1e2030',
-            'border:1px solid rgba(255,255,255,0.15)',
-            'cursor:pointer',
-            'transition:background 0.15s,border-color 0.15s,color 0.15s',
-            'white-space:nowrap',
-            'font-family:inherit',
-        ].join(';');
-        pill.innerHTML = '<span aria-hidden="true" style="font-size:13px;line-height:1">♩</span>'
-                       + '<span>Staffview</span>'
-                       + '<span aria-hidden="true" style="font-size:10px;opacity:0.8">▾</span>';
-
-        // ── Popover ───────────────────────────────────────────────
-        const popover = document.createElement('div');
-        popover.id    = 'sv-popover-' + _instanceId;
-        popover.setAttribute('role', 'dialog');
-        popover.setAttribute('aria-label', 'Staffview options');
-        popover.style.cssText = [
-            'display:none',
-            'position:absolute',
-            'left:0',
-            'bottom:calc(100% + 6px)',
-            inSS ? 'z-index:10' : 'z-index:60',
-            'width:max-content',
-            'max-width:min(320px,calc(100vw - 32px))',
-            'padding:10px 14px',
-            'border-radius:12px',
-            'border:1px solid rgba(255,255,255,0.12)',
-            'background:rgba(12,12,22,0.98)',
-            'box-shadow:0 12px 30px rgba(0,0,0,0.5)',
-            'font-family:system-ui,sans-serif',
-            'font-size:12px',
-            'color:#cbd5e1',
-            'pointer-events:auto',
-        ].join(';');
-
-        // Header
-        const hdr = document.createElement('div');
-        hdr.style.cssText = 'font-weight:700;font-size:11px;letter-spacing:0.06em;'
-                          + 'text-transform:uppercase;color:#6b7280;margin-bottom:8px';
-        hdr.textContent = '♩ Staffview';
-        popover.appendChild(hdr);
-
-        // ── Controls row: [checkbox] Playback  [⏮] [▶/⏸] [⏹] ────
-        const row = document.createElement('div');
-        row.style.cssText = 'display:flex;align-items:center;gap:8px';
-
-        // Checkbox
-        const cb = document.createElement('input');
-        cb.type    = 'checkbox';
-        cb.id      = 'sv-cb-playback-' + _instanceId;
-        cb.checked = _svPlaybackOn;
-        cb.style.cssText = 'accent-color:#4080e0;cursor:pointer;flex-shrink:0';
-        cb.addEventListener('change', () => {
-            _svSetPlaybackMode(cb.checked, _svInitToken);
-        });
-
-        const cbLabel = document.createElement('label');
-        cbLabel.htmlFor = cb.id;
-        cbLabel.style.cssText = 'font-size:12px;font-weight:600;letter-spacing:0.02em;'
-                              + 'color:#9ca3af;cursor:pointer;user-select:none;flex-shrink:0';
-        cbLabel.textContent = 'Playback';
-
-        // Transport buttons (hidden until checkbox is ticked)
-        function _mkBtn(symbol, title) {
-            const b = document.createElement('button');
-            b.type = 'button';
-            b.title = title;
-            b.dataset.svTransport = '1';
-            b.textContent = symbol;
-            b.style.cssText = [
-                'display:none',            // shown when _svPlaybackOn
-                'align-items:center',
-                'justify-content:center',
-                'width:26px',
-                'height:26px',
-                'padding:0',
-                'border-radius:6px',
-                'font-size:13px',
-                'line-height:1',
-                'color:#cbd5e1',
-                'background:#2a2d40',
-                'border:1px solid rgba(255,255,255,0.12)',
-                'cursor:pointer',
-                'font-family:inherit',
-                'flex-shrink:0',
-            ].join(';');
-            b.addEventListener('mouseenter', () => { b.style.background = '#373b55'; });
-            b.addEventListener('mouseleave', () => { b.style.background = '#2a2d40'; });
-            return b;
-        }
-
-        const rewindBtn = _mkBtn('⏮', 'Rewind to start');
-        const playBtn   = _mkBtn('▶', 'Play');
-        const stopBtn   = _mkBtn('⏹', 'Stop');
-
-        rewindBtn.addEventListener('click', () => {
-            if (!_svApi || !_svSoundFontReady) return;
-            try { _svApi.tickPosition = 0; } catch (_) {}
-        });
-        playBtn.addEventListener('click', () => {
-            // Toggle play/pause based on intent flag, not _svPlayerTick.
-            if (!_svApi || !_svSoundFontReady) { _svPendingPlay = true; return; }
-            if (_svSynthPlaying) {
-                _svSynthPause();
-            } else {
-                _svSynthPlay();
-            }
-        });
-        stopBtn.addEventListener('click', () => {
-            _svSynthStop();
-        });
-
-        // Store refs for _svUpdatePlayBtn() and _svSetPlaybackMode()
-        _svPlayBtn = playBtn;
-        _svStopBtn = stopBtn;
-
-        row.appendChild(cb);
-        row.appendChild(cbLabel);
-        row.appendChild(rewindBtn);
-        row.appendChild(playBtn);
-        row.appendChild(stopBtn);
-        popover.appendChild(row);
-
-        // Show transport buttons if checkbox starts checked (shouldn't happen
-        // normally — playback resets on each song — but guard anyway).
-        if (_svPlaybackOn) {
-            [rewindBtn, playBtn, stopBtn].forEach(b => { b.style.display = 'inline-flex'; });
-        }
-
-        // ── Toggle popover on pill click ──────────────────────────
-        let _closeOnOutside = null;
-        pill.addEventListener('click', () => {
-            const open = popover.style.display !== 'none';
-            if (open) {
-                popover.style.display = 'none';
-                pill.setAttribute('aria-expanded', 'false');
-                if (_closeOnOutside) {
-                    document.removeEventListener('mousedown', _closeOnOutside, true);
-                    _closeOnOutside = null;
-                }
-            } else {
-                popover.style.display = 'block';
-                pill.setAttribute('aria-expanded', 'true');
-                _closeOnOutside = (e) => {
-                    if (!wrap.contains(e.target)) {
-                        popover.style.display = 'none';
-                        pill.setAttribute('aria-expanded', 'false');
-                        document.removeEventListener('mousedown', _closeOnOutside, true);
-                        _closeOnOutside = null;
-                    }
-                };
-                // Defer one tick so the triggering click doesn't immediately close.
-                setTimeout(() => {
-                    document.addEventListener('mousedown', _closeOnOutside, true);
-                }, 0);
-            }
-        });
-
-        wrap.appendChild(popover);
-        wrap.appendChild(pill);
-        if (slot) {
-            // v3 slot: plain append — the legacy prepend anchor reasoning
-            // below applies only to the v2 footer.
-            footer.appendChild(wrap);
-        } else {
-            // Prepend so the pill appears above #player-controls in the footer,
-            // not below it. insertBefore with firstChild works even when the
-            // footer is empty (firstChild is null → equivalent to appendChild).
-            footer.insertBefore(wrap, footer.firstChild);
-        }
-        _svPillWrap = wrap;
-    }
-
-    function _svRemovePill() {
-        if (_svPillRetryTimer) { clearTimeout(_svPillRetryTimer); _svPillRetryTimer = null; }
-        if (_svSlotObserver)   { _svSlotObserver.disconnect(); _svSlotObserver = null; }
-        _svPillRetries = 0;
-        if (_svPillWrap) {
-            _svPillWrap.remove();
-            _svPillWrap = null;
-        }
-        _svPlayBtn     = null;
-        _svStopBtn     = null;
-        _svPlaybackOn  = false;
-        _svPendingPlay = false;
-    }
-
-    // Show/hide the transport buttons when the Playback checkbox is toggled.
-    // Does NOT start alphaSynth — the user must hit ▶.
-    // When unchecked: stops alphaSynth and restores OGG if we paused it.
-    function _svSetPlaybackMode(on, myToken) {
-        if (_svInitToken !== myToken) return;
-        _svPlaybackOn = on;
-
-        // Show or hide transport buttons (rewind, play, stop).
-        if (_svPillWrap) {
-            const btns = _svPillWrap.querySelectorAll('[data-sv-transport]');
-            btns.forEach(b => {
-                b.style.display = on ? 'inline-flex' : 'none';
-            });
-        }
-
-        // Update pill active indicator.
-        const pill = _svPillWrap && _svPillWrap.querySelector('#sv-pill-' + _instanceId);
-        if (pill) {
-            if (on) {
-                pill.style.background   = 'rgba(64,128,224,0.2)';
-                pill.style.borderColor  = '#4080e0';
-                pill.style.color        = '#1e2030';
-            } else {
-                pill.style.background   = '#1e2030';
-                pill.style.borderColor  = 'rgba(255,255,255,0.15)';
-                pill.style.color        = '#cbd5e1';
-            }
-        }
-
-        if (!on) {
-            // Checkbox unticked — stop alphaSynth and restore OGG.
-            _svSynthStop();
         }
     }
 
@@ -1106,137 +735,6 @@ function createFactory() {
         }
     }
 
-    // ── alphaSynth transport helpers ───────────────────────────────
-    // These are the single entry points for play/pause/stop. They manage
-    // OGG/alphaSynth mutual exclusion and keep the button icon in sync.
-    //
-    // Rule: if one source is playing, the other pauses.
-    //   _svSynthPlay()  → pause OGG (if playing), start alphaSynth
-    //   _svSynthPause() → pause alphaSynth, restore OGG (if we paused it)
-    //   _svSynthStop()  → stop alphaSynth (tick 0), restore OGG if needed
-    //
-    // _svOggPausedByUs tracks whether WE called audio.pause() so we only
-    // restore it if we were the ones who stopped it.
-
-    function _svUpdatePlayBtn() {
-        if (!_svPlayBtn) return;
-        _svPlayBtn.textContent = _svSynthPlaying ? '⏸' : '▶';
-        _svPlayBtn.title       = _svSynthPlaying ? 'Pause' : 'Play';
-    }
-
-    function _svSynthPlay() {
-        if (!_svApi) return;
-        // Pause OGG if it is currently playing.
-        const audio = document.getElementById('audio');
-        if (audio && !audio.paused) {
-            audio.pause();
-            _svOggPausedByUs = true;
-        }
-        // Install the bridge so that if the user later hits the feedBack
-        // play button, alphaSynth yields back to OGG.
-        _svInstallSongBridge(_svInitToken);
-        // Start alphaSynth.
-        if (_svSoundFontReady) {
-            try { _svApi.play(); } catch (_) {}
-        } else {
-            _svPendingPlay = true;
-        }
-        _svSynthPlaying = true;
-        _svUpdatePlayBtn();
-    }
-
-    function _svSynthPause() {
-        if (!_svApi) return;
-        _svPendingPlay  = false;
-        _svSynthPlaying = false;
-        try { _svApi.pause(); } catch (_) {}
-        _svPlayerTick = -1;
-        _svUpdatePlayBtn();
-        // Restore OGG if we paused it.
-        if (_svOggPausedByUs) {
-            _svOggPausedByUs = false;
-            const audio = document.getElementById('audio');
-            if (audio) { try { audio.play(); } catch (_) {} }
-        }
-    }
-
-    function _svSynthStop() {
-        _svPendingPlay  = false;
-        _svSynthPlaying = false;
-        if (_svApi) { try { _svApi.stop(); } catch (_) {} }
-        _svPlayerTick = -1;
-        _svLastTick   = -1;
-        _svLastBeat   = null;
-        _svUpdateMarker();
-        _svUpdatePlayBtn();
-        _svRemoveSongBridge();
-        // Restore OGG if we paused it.
-        if (_svOggPausedByUs) {
-            _svOggPausedByUs = false;
-            const audio = document.getElementById('audio');
-            if (audio) { try { audio.play(); } catch (_) {} }
-        }
-    }
-
-    // ── alphaSynth transport bridge ────────────────────────────────
-    // Installed only while alphaSynth is playing (i.e. after the user
-    // hits ▶ in the popover). Listens for two events:
-    //
-    //   OGG 'play'   → the user hit the feedBack play button while
-    //                  alphaSynth was running; yield — pause alphaSynth
-    //                  and let OGG take over.
-    //   song:stop    → song switch / teardown; stop alphaSynth entirely.
-    //
-    // No seek guard, no end guard, no 'pause' mirror — we are not
-    // syncing alphaSynth to OGG transport anymore.
-
-    function _svInstallSongBridge(myToken) {
-        _svRemoveSongBridge();
-
-        const audio = document.getElementById('audio');
-        if (!audio) return;
-
-        // OGG started playing → alphaSynth yields.
-        const onAudioPlay = () => {
-            if (_svInitToken !== myToken || !_svApi) return;
-            // OGG took over — pause alphaSynth (do NOT restore OGG here;
-            // OGG is already playing, that's what triggered this).
-            _svPendingPlay   = false;
-            _svSynthPlaying  = false;
-            try { _svApi.pause(); } catch (_) {}
-            _svPlayerTick    = -1;
-            _svOggPausedByUs = false;
-            _svUpdatePlayBtn();
-            _svRemoveSongBridge();
-        };
-
-        // song:stop — song switch / Close.
-        const onStop = () => {
-            if (_svInitToken !== myToken) return;
-            _svOggPausedByUs = false;  // OGG is stopping anyway
-            _svSynthStop();
-        };
-
-        audio.addEventListener('play', onAudioPlay);
-        if (window.feedBack && typeof window.feedBack.on === 'function') {
-            window.feedBack.on('song:stop', onStop);
-        }
-
-        _svSongEventHandlers = { onAudioPlay, onStop, audio };
-    }
-
-    function _svRemoveSongBridge() {
-        if (!_svSongEventHandlers) return;
-        const h = _svSongEventHandlers;
-        if (h.audio) {
-            h.audio.removeEventListener('play', h.onAudioPlay);
-        }
-        if (window.feedBack && typeof window.feedBack.off === 'function') {
-            window.feedBack.off('song:stop', h.onStop);
-        }
-        _svSongEventHandlers = null;
-    }
-
     // ── alphaTab init ──────────────────────────────────────────────
 
     async function _svInitAlphaTab(myToken) {
@@ -1244,15 +742,12 @@ function createFactory() {
         if (!c) return;
 
         if (_svApi) {
-            try { _svApi.stop(); } catch (_) {}
             try { _svApi.destroy(); } catch (_) {}
             _svApi = null;
         }
-        _svApiReady       = false;
-        _svSoundFontReady = false;
-        _svPlayerTick     = -1;
-        _svAtBeats        = [];
-        _svLastBeat       = null;
+        _svApiReady = false;
+        _svAtBeats  = [];
+        _svLastBeat = null;
         if (_svAtMount) _svAtMount.innerHTML = '';
 
         await _loadAlphaTab();
@@ -1271,68 +766,19 @@ function createFactory() {
                     : 2,   // Score-only: no tablature staff
             },
             player: {
-                enablePlayer: true,
+                // No alphaTab synth: the host owns audio (OGG). Disabling
+                // the player drops the soundfont CDN download entirely and
+                // removes the player-ready dependency (same as tabview).
+                enablePlayer: false,
                 enableCursor: false,   // we draw our own marker
-                soundFont:    ALPHATAB_CDN_BASE + '/soundfont/sonivox.sf2',
             },
         });
 
         // ── Score loaded ─────────────────────────────────────────
         _svApi.scoreLoaded.on((score) => {
             if (_svInitToken !== myToken) return;
-            _svAtBeats    = _svBuildBeatTimeline(score);
-            _svLastBeat   = null;
-            _svPlayerTick = -1;
-        });
-
-        // ── Sound font ready ──────────────────────────────────────
-        // api.play() must not be called before soundFontLoaded fires.
-        // If a play request arrived while loading, execute it now.
-        _svApi.soundFontLoaded.on(() => {
-            if (_svInitToken !== myToken) return;
-            _svSoundFontReady = true;
-            if (_svPendingPlay && _svPlaybackOn) {
-                _svPendingPlay = false;
-                try { _svApi.play(); } catch (_) {}
-            }
-        });
-
-        // ── Player position → cursor ──────────────────────────────
-        // playerPositionChanged fires every ~50 ms while alphaSynth plays.
-        // args: { currentTick, currentTime, endTick, endTime, isSeek, ... }
-        // When alphaSynth is driving, use currentTick directly; skip the
-        // bundle.beats lookup (that path is for Scenario 3 only).
-        _svApi.playerPositionChanged.on((args) => {
-            if (_svInitToken !== myToken || !_svApiReady) return;
-            const tick = args && typeof args.currentTick === 'number'
-                ? args.currentTick : -1;
-            if (tick < 0) return;
-            _svPlayerTick = tick;
-            if (Math.abs(tick - _svLastTick) <= TICK_DELTA_THRESHOLD) return;
-            _svLastTick = tick;
-            _svLastBeat = _svFindBeatAtTick(tick);
-            _svUpdateMarker();
-        });
-
-        // ── Player finished ───────────────────────────────────────
-        // AlphaSynth already calls its own stop() internally before
-        // firing finished — state is Paused at tick 0 by the time this
-        // handler runs. Reset cursor/intent state and the button to ▶.
-        // Do NOT restore OGG here — audio.play() would restart it from
-        // the beginning, and the resulting 'play' event would fire the
-        // bridge and immediately kill the next alphaSynth play() call.
-        // OGG is restored only on explicit user action (pause/stop btn)
-        // or teardown. Do NOT call api.stop() — already stopped.
-        _svApi.playerFinished.on(() => {
-            if (_svInitToken !== myToken) return;
-            _svPendingPlay  = false;
-            _svSynthPlaying = false;
-            _svPlayerTick   = -1;
-            _svLastBeat     = null;
-            _svUpdateMarker();
-            _svUpdatePlayBtn();
-            _svRemoveSongBridge();
-            _svOggPausedByUs = false;
+            _svAtBeats  = _svBuildBeatTimeline(score);
+            _svLastBeat = null;
         });
 
         // ── Render finished → reveal container ────────────────────
@@ -1361,10 +807,9 @@ function createFactory() {
             console.error('[staffview] alphaTab error:', e);
             const failedFile = _svCurrentFile || _svLoadingFile;
             const failedArr  = _svCurrentArr  != null ? _svCurrentArr : _svLoadingArr;
-            _svApiReady       = false;
-            _svSoundFontReady = false;
-            _svCurrentFile    = null;
-            _svCurrentArr     = null;
+            _svApiReady    = false;
+            _svCurrentFile = null;
+            _svCurrentArr  = null;
             if (failedFile != null) { _svFailedFile = failedFile; _svFailedArr = failedArr; }
             if (_svContainer) _svContainer.style.visibility = 'hidden';
             if (_svHighwayCanvas) _svHighwayCanvas.style.visibility = _svPrevVisibility || '';
@@ -1404,8 +849,6 @@ function createFactory() {
             _svCurrentArr  = _svLoadingArr;
             // DO NOT show the container here — renderFinished handles the
             // visibility swap once alphaTab has actually painted output.
-            // The alphaSynth bridge is installed only when the user enables
-            // Playback mode via the pill — not unconditionally here.
         } catch (e) {
             if (_svInitToken !== myToken) return;
             console.error('[staffview] score build / render failed:', e);
@@ -1488,14 +931,9 @@ function createFactory() {
     }
 
     // ── Cursor sync ────────────────────────────────────────────────
-    // Scenario 3 path: maps bundle.currentTime → MIDI ticks via the
-    // bundle.beats stream. Skipped when alphaSynth is driving the cursor
-    // via playerPositionChanged (_svPlayerTick >= 0).
+    // Maps bundle.currentTime → MIDI ticks via the bundle.beats stream.
 
     function _svSyncCursor(currentTime) {
-        // When alphaSynth is playing, playerPositionChanged owns the cursor.
-        if (_svPlayerTick >= 0) return;
-
         if (!_svApi || !_svApiReady || !_svLatestBeats) return;
 
         const beats = _svLatestBeats;
@@ -1604,40 +1042,25 @@ function createFactory() {
     // ── Teardown ───────────────────────────────────────────────────
 
     function _svTeardown(restoreCanvas) {
-        _svApiReady       = false;
-        _svSoundFontReady = false;
-        _svPlayerTick     = -1;
-        _svLastTick       = -1;
-        _svLastBeat       = null;
-        _svAtBeats        = [];
-        _svLatestBeats    = null;
-        _svCurrentFile    = null;
-        _svCurrentArr     = null;
-        _svLoadingFile    = null;
-        _svLoadingArr     = null;
-        _svFailedFile     = null;
-        _svFailedArr      = null;
-        _svInfo           = null;
-        _svMeasures       = [];
-        _svNotationReady  = false;
-        _svRendered       = false;
-        _svPendingPlay    = false;
-        _svPlayBtn        = null;
-        _svStopBtn        = null;
-        _svSynthPlaying   = false;
+        _svApiReady      = false;
+        _svLastTick      = -1;
+        _svLastBeat      = null;
+        _svAtBeats       = [];
+        _svLatestBeats   = null;
+        _svCurrentFile   = null;
+        _svCurrentArr    = null;
+        _svLoadingFile   = null;
+        _svLoadingArr    = null;
+        _svFailedFile    = null;
+        _svFailedArr     = null;
+        _svInfo          = null;
+        _svMeasures      = [];
+        _svNotationReady = false;
+        _svRendered      = false;
 
-        // Restore OGG if we paused it on behalf of alphaSynth.
-        if (_svOggPausedByUs) {
-            _svOggPausedByUs = false;
-            const audio = document.getElementById('audio');
-            if (audio) { try { audio.play(); } catch (_) {} }
-        }
-
-        _svRemoveSongBridge();
         _svCloseWs();
 
         if (_svApi) {
-            try { _svApi.stop(); }    catch (_) {}
             try { _svApi.destroy(); } catch (_) {}
             _svApi = null;
         }
