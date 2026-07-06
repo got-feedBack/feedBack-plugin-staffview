@@ -10,6 +10,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Migrated to the `window.feedBack` namespace** — the host bus
+  (`.on`/`.off`), `uiVersion`, and `ui.playerControlSlot()` reads now go
+  through `window.feedBack` instead of the pre-rename `window.slopsmith`
+  alias. `window.feedBackViz_staffview` is now the sole viz-picker
+  registration (the picker only ever looked up `feedBackViz_<id>`; the old
+  `slopsmithViz_staffview` name had no consumer and has been dropped).
+  Splitscreen detection reads `window.feedBackSplitscreen` first, falling
+  back to `window.slopsmithSplitscreen` since the published splitscreen
+  plugin currently only exports the latter — this fallback stays until
+  splitscreen itself is renamed.
+
 - **Curated into the slopsmith org** (slopsmith#823, epic slopsmith#828):
   `private: false`, one-line `description`, and the promoted
   `visualization` capability declaration (`standards` +
