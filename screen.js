@@ -517,7 +517,7 @@ function createFactory() {
         // ── Click-to-seek ─────────────────────────────────────────
         // mousedown on the score div: resolve the clicked position to a
         // beat tick via boundsLookup.getBeatAtPos(), then seek the OGG
-        // audio element (currentTime).
+        // audio element (currentTime) via the bundle.beats time stream.
         inner.addEventListener('mousedown', (e) => {
             if (!_svApi || !_svApiReady) return;
             const bl = _svApi.boundsLookup;
@@ -544,16 +544,12 @@ function createFactory() {
             _svLastBeat = beat;
             _svUpdateMarker();
 
-            // Seek the OGG audio element using the bundle.beats map.
-            // Convert tick back to seconds: secs = tick / (BPM/60 * 960).
-            // Use the score tempo as approximation.
-            try {
-                const score = _svApi && _svApi.score;
-                const bpm   = (score && score.tempo) ? score.tempo : 120;
-                const secs  = tick / ((bpm / 60) * 960);
+            // Seek the OGG audio element.
+            const secs = _svBeatToSeconds(beat);
+            if (secs !== null) {
                 const audio = document.getElementById('audio');
-                if (audio) audio.currentTime = secs;
-            } catch (_) {}
+                if (audio) { try { audio.currentTime = secs; } catch (_) {} }
+            }
         });
 
         // ResizeObserver on controls bar so bottom inset stays correct
@@ -932,6 +928,36 @@ function createFactory() {
             else { hi = mid - 1; }
         }
         return arr[ans].beat;
+    }
+
+    // Converts a beat's tick to seconds via _svLatestBeats.
+    // _svSyncCursor maps bundle.beats[i].time → tick via tick = (i + frac) * 960;
+    // invert that: beatIndex = tick / 960, interpolate between adjacent entries.
+    // Falls back to a score-tempo BPM approximation when beat data is not
+    // loaded yet (wrong for tempo-varying songs, but better than no seek).
+    function _svBeatToSeconds(beat) {
+        const tick = typeof beat.absoluteDisplayStart === 'number'
+            ? beat.absoluteDisplayStart
+            : (typeof beat.absolutePlaybackStart === 'number'
+                ? beat.absolutePlaybackStart : null);
+        if (tick === null) return null;
+        if (_svLatestBeats && _svLatestBeats.length >= 2) {
+            const beatIdx = tick / 960;
+            const i       = Math.floor(beatIdx);
+            const frac    = beatIdx - i;
+            if (i >= 0 && i < _svLatestBeats.length) {
+                const t0 = _svLatestBeats[i].time;
+                if (i + 1 < _svLatestBeats.length) {
+                    return t0 + frac * (_svLatestBeats[i + 1].time - t0);
+                }
+                return t0;
+            }
+        }
+        try {
+            const score = _svApi && _svApi.score;
+            const bpm   = (score && score.tempo) ? score.tempo : 120;
+            return tick / ((bpm / 60) * 960);
+        } catch (_) { return null; }
     }
 
     // ── Cursor sync ────────────────────────────────────────────────

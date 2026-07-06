@@ -21,6 +21,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Click-to-seek uses the `bundle.beats` time stream** — the clicked
+  beat's tick is now converted to seconds by inverting the cursor-sync
+  mapping (`tick = (beatIndex + frac) * 960`) against the host's beat
+  timestamps, instead of a single-BPM approximation that landed on the
+  wrong position in any tempo-varying song. The BPM path remains only as
+  a fallback while beat data hasn't arrived yet.
 - **Empty measures render a whole rest** — the empty-voice filler beat no
   longer sets `isEmpty = true`, which told alphaTab to skip the glyph
   entirely and left the measure blank. With no notes added alphaTab derives
