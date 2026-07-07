@@ -10,6 +10,71 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **MIDI input + note-detection scoring** — connects a MIDI keyboard and
+  judges played notes against the loaded score (±100ms tolerance).
+  - Device connection goes through the core `midi-input` capability domain
+    (`window.feedBack.midiInput`) rather than a private
+    `requestMIDIAccess()` — mirrors `plugins/keys_highway_3d`'s connection
+    pattern (the piano effort's established contract): async-race-guarded
+    connect (a generation counter discards a stale `open()` response after
+    a rapid device switch), saved-device-pick persistence with
+    name/id/key fallback matching, and recovery-only reconnect on
+    `midi-input:sources-changed` (a transient unplug never substitutes a
+    different device for an absent saved pick). Device + channel `<select>`
+    row in the pill's new MIDI section, synced across every mounted pill
+    instance.
+  - In splitscreen, MIDI events route only to the currently-**focused**
+    panel (`_ssActiveFull`/`onFocusChange`/`isCanvasFocused`, falling back
+    to "always focused" when splitscreen lacks that surface) — the main
+    player has only one panel, so this is a no-op there.
+  - Reports hits/misses through the core **note-detection** capability
+    domain rather than judging silently in isolation: registers once as a
+    `'midi'` provider (idempotent across instances/song loads), opens a
+    context-scoped binding per chart load (`{arrangement:'notation',
+    midiLow, midiHigh}`, derived from the score's actual note range),
+    and reports via `reportHit`/`reportMiss` — consumers own judgment,
+    the domain only carries the observability event (spec 009 doctrine).
+    A superseded binding from a rapid song switch is closed instead of
+    stored, mirroring `keys_highway_3d`'s own supersession guard.
+  - The provider registration and MIDI domain session are released only
+    when the **last** staffview instance is torn down, not on every
+    instance's destroy — a splitscreen sibling keeps both alive.
+  - Suppresses the generic `note_detect` plugin's default singleton while
+    a staffview instance is mounted, since staffview owns its own
+    MIDI-based judgment over the same notes.
+  - `_svParseMidiMessage()` (raw MIDI byte → normalized note-on/off/sustain
+    event) extracted as a pure, unit-tested module-level helper.
+  - Not included in this PR: audible feedback for the MIDI keyboard (no
+    monitor synth yet — separately scoped) and visual hit/miss feedback on
+    the score itself (miss-dots, hand coloring — also separately scoped;
+    unlike the guitar/bass highway, staffview replaces the highway canvas
+    entirely and has no "gems" to light via `setNoteStateProvider`).
+
+### Fixed
+
+- **Note-detection provider never registered for charts with no judge
+  notes** — `_svNdOpenBindingForChart` computed the chart's MIDI range
+  before registering the provider and returned early when the range came
+  back `null`, skipping registration entirely rather than just skipping
+  the (legitimately chart-dependent) binding. Registration is now
+  unconditional, matching `keys_highway_3d`'s `_ndEnsureProvider()` —
+  confirmed against the live `note-detection`/`midi-input` domain state
+  (`capabilities.command(..., 'inspect', ...)`) that `staffview-midi`
+  registers, opens a context-scoped binding, and reports real hit/miss
+  events end-to-end.
+- **MIDI device never showing in the pill's own dropdown** —
+  `_svMidiNotifyDeviceListChanged()` calls
+  `document.querySelectorAll('.sv-midi-select')` to update every mounted
+  pill's select, but the pill's "populate immediately if the device list
+  is already known" call ran while the popover DOM was still detached
+  (built off-document, only attached to `document` once the whole `wrap`
+  is appended at the very end of `_svCreatePill()`), so the query matched
+  nothing and silently no-op'd. The domain-side connection was never
+  affected — `capabilities.command('midi-input', 'inspect', ...)` showed
+  the device correctly connected and open throughout — only this plugin's
+  own UI never learned about it. Moved the call to after `wrap` is
+  actually appended to the live document.
+
 - **Options pill: LAYOUT and ZOOM controls** — reintroduces the ♩ Staff View
   pill removed alongside alphaSynth playback, now carrying only non-playback
   formatting controls. Mounts into the v3 plugin-control slot
