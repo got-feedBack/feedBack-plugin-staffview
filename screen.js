@@ -76,6 +76,7 @@ const _SV_MIDI_BLOCKLIST_RE = /midi through|^thru\b|^iac\b/i;
 
 const _SV_STORE_SYNTH_INST = 'staffview_synth_inst';
 const _SV_STORE_SYNTH_VOL  = 'staffview_synth_vol';
+const _SV_STORE_PREROLL    = 'staffview_preroll';
 
 // ═══════════════════════════════════════════════════════════════════════
 // Module-level singletons
@@ -1112,6 +1113,26 @@ function createFactory() {
     let _svRhBtn        = null;
     let _svLhBtn        = null;
 
+    // ── Study mode ──────────────────────────────────────────────────
+    // Note-by-note gated practice: the OGG pauses at each gate (a beat's
+    // required notes) and only resumes once they are all played on MIDI.
+    let _svStudyMode         = false;
+    let _svStudyGates        = [];     // [{gateTime, entries[]}] sorted by gateTime
+    let _svStudyGateIdx      = 0;      // index of the current gate
+    let _svStudyGateTime     = null;   // OGG seconds at which to pause; null = none
+    const _svStudyChordHit   = new Set();   // noteKeys satisfied at the current gate
+    let _svStudyBtnEl        = null;
+    let _svStudyCountingDown = false;
+    let _svStudyCountdownId  = null;
+    let _svStudyAudioCtx     = null;   // metronome beeps; closed on teardown
+    let _svStudySeekHandler  = null;   // 'seeked' listener for platform seeks
+    const _svStudyWrongAttempts = new Map();   // gateIdx → Set<wrongMidi>
+
+    // ── Global preroll ──────────────────────────────────────────────
+    let _svPrerollEnabled  = _svReadStore(_SV_STORE_PREROLL) !== 'false';
+    let _svPrerollResuming = false;   // true when audio.play() was our own call
+    let _svWasAudioPaused  = null;    // null = unobserved; tracks pause→play edges
+
     // ── Miss-dot overlay ───────────────────────────────────────────
     // A persistent canvas (below the playback marker's z-index) sweeps
     // judge notes as playback passes their hit window and draws a small
@@ -1820,10 +1841,62 @@ function createFactory() {
         _svLhBtn   = lhBtn;
         _svUpdateHandButtons();   // reflect current _svActiveHands
 
+        // ── STUDY section (note-by-note gated practice) ────────────
+        const studySection = document.createElement('div');
+        studySection.style.cssText =
+            'margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px';
+
+        const studyLabel = document.createElement('span');
+        studyLabel.className = 'section-practice-label';
+        studyLabel.textContent = 'STUDY';
+
+        const studyRow = document.createElement('div');
+        studyRow.className = 'section-practice-controls-row';
+        studyRow.style.marginTop = '4px';
+
+        const studyBtn = document.createElement('button');
+        studyBtn.type = 'button';
+        studyBtn.textContent = 'Study mode';
+        studyBtn.title = 'Play through the song note by note';
+        studyBtn.className = btnCls;
+        studyBtn.addEventListener('click',
+            () => { if (_svStudyMode) _svStudyDeactivate(); else _svStudyActivate(); });
+        _svStudyBtnEl = studyBtn;
+        _svUpdateStudyBtn();   // reflect current _svStudyMode
+
+        const studyDesc = document.createElement('div');
+        studyDesc.textContent = 'Play through the song note by note';
+        studyDesc.style.cssText = 'font-size:0.7em;color:rgba(255,255,255,0.4);margin-top:4px';
+
+        studyRow.appendChild(studyBtn);
+        studySection.appendChild(studyLabel);
+        studySection.appendChild(studyRow);
+        studySection.appendChild(studyDesc);
+
+        // Preroll count-in toggle (persisted).
+        const prerollRow = document.createElement('label');
+        prerollRow.className = 'section-practice-controls-row';
+        prerollRow.style.cssText = 'margin-top:6px;align-items:center;gap:6px;cursor:pointer';
+        const prerollChk = document.createElement('input');
+        prerollChk.type    = 'checkbox';
+        prerollChk.checked = _svPrerollEnabled;
+        prerollChk.addEventListener('change', () => {
+            _svPrerollEnabled = prerollChk.checked;
+            _svSaveStore(_SV_STORE_PREROLL, String(_svPrerollEnabled));
+        });
+        const prerollText = document.createElement('span');
+        prerollText.className = 'section-practice-label';
+        prerollText.textContent = 'Preroll count-in';
+        prerollText.style.cssText = 'font-size:10px;opacity:0.7';
+        prerollRow.appendChild(prerollChk);
+        prerollRow.appendChild(prerollText);
+        studySection.appendChild(prerollRow);
+
         popover.appendChild(midiSection);
         popover.appendChild(layoutSection);
         popover.appendChild(zoomSection);
         popover.appendChild(handSection);
+        popover.appendChild(studySection);
 
         // ── Toggle popover on pill click ───────────────────────────
         pill.addEventListener('click', () => {
@@ -1922,6 +1995,7 @@ function createFactory() {
         _svHandRow        = null;
         _svRhBtn          = null;
         _svLhBtn          = null;
+        _svStudyBtnEl     = null;
     }
 
     // ── Error banner ───────────────────────────────────────────────
@@ -2313,6 +2387,9 @@ function createFactory() {
     // Maps bundle.currentTime → MIDI ticks via the bundle.beats stream.
 
     function _svSyncCursor(currentTime) {
+        // In study mode the cursor is driven by _svStudySnapCursor (gate
+        // position), not audio time — suppress here to avoid fighting snaps.
+        if (_svStudyMode) return;
         if (!_svApi || !_svApiReady || !_svLatestBeats) return;
 
         const beats = _svLatestBeats;
@@ -2666,8 +2743,62 @@ function createFactory() {
         ctx.fill();
     }
 
+    // MIDI note → diatonic step number (C-major staff position), used to place
+    // a wrong-note X at its true pitch on the staff.
+    function _svMidiToDiatonic(midi) {
+        const chromToD = [0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 5, 6];
+        return (Math.floor(midi / 12) - 1) * 7 + chromToD[midi % 12];
+    }
+
+    // Study mode: draw an orange X at the pitch the player actually hit (wrong),
+    // offset from the nearest gate notehead by the diatonic distance, with
+    // clef-aware ledger lines when the pitch sits off the staff.
+    function _svDrawStudyWrongX(ctx, wrongMidi, gateEntries) {
+        if (!gateEntries || !gateEntries.length) return;
+        const bl = _svApi && _svApi.boundsLookup;
+        if (!bl || typeof bl.findBeat !== 'function') return;
+        const ref = gateEntries.reduce((best, n) =>
+            Math.abs(n.midi - wrongMidi) < Math.abs(best.midi - wrongMidi) ? n : best
+        );
+        const beatBounds = bl.findBeat(ref.beat);
+        if (!beatBounds || !beatBounds.notes) return;
+        const nb = beatBounds.notes[ref.noteIdx];
+        if (!nb || !nb.noteHeadBounds) return;
+        const nhb = nb.noteHeadBounds;
+        const refD  = _svMidiToDiatonic(ref.midi);
+        const wrongD = _svMidiToDiatonic(wrongMidi);
+        const dOff  = wrongD - refD;
+        const ls    = nhb.h;            // line spacing ≈ notehead height
+        const refCY = nhb.y + ls / 2;
+        const cx    = Math.round(nhb.x + nhb.w / 2);
+        const cy    = Math.round(refCY - dOff * ls / 2);
+
+        // Ledger lines: treble bottom = E4 (diatonic 30), bass bottom = G2 (18)
+        const bottomD = ref.hand === 0 ? 30 : 18;
+        const topD    = bottomD + 8;
+        const halfW   = Math.round(nhb.w * 0.75);
+        ctx.strokeStyle = '#f97316';
+        ctx.lineWidth   = 1;
+        for (let d = bottomD - 2; d >= wrongD; d -= 2) {
+            const ly = Math.round(refCY - (d - refD) * ls / 2);
+            ctx.beginPath(); ctx.moveTo(cx - halfW, ly); ctx.lineTo(cx + halfW, ly); ctx.stroke();
+        }
+        for (let d = topD + 2; d <= wrongD; d += 2) {
+            const ly = Math.round(refCY - (d - refD) * ls / 2);
+            ctx.beginPath(); ctx.moveTo(cx - halfW, ly); ctx.lineTo(cx + halfW, ly); ctx.stroke();
+        }
+
+        const arm = 3;
+        ctx.beginPath();
+        ctx.moveTo(cx - arm, cy - arm); ctx.lineTo(cx + arm, cy + arm);
+        ctx.moveTo(cx + arm, cy - arm); ctx.lineTo(cx - arm, cy + arm);
+        ctx.lineWidth = 2;
+        ctx.stroke();
+    }
+
     // Full repaint of every recorded miss dot — cheap, and the only reliable
     // way to keep dots aligned after an alphaTab relayout (bounds change).
+    // Also repaints study-mode wrong-note X markers when active.
     function _svRedrawAllMissDots() {
         if (!_svMissCanvas) return;
         const ctx = _svMissCanvas.getContext('2d');
@@ -2676,6 +2807,15 @@ function createFactory() {
         for (const key of _svMissNotes) {
             const entry = _svMissEntryByKey.get(key);
             if (entry) _svDrawMissDot(ctx, entry);
+        }
+        if (_svStudyMode) {
+            for (const [gateIdx, midiSet] of _svStudyWrongAttempts) {
+                const gate = _svStudyGates[gateIdx];
+                if (!gate) continue;
+                for (const wrongMidi of midiSet) {
+                    _svDrawStudyWrongX(ctx, wrongMidi, gate.entries);
+                }
+            }
         }
     }
 
@@ -2784,6 +2924,21 @@ function createFactory() {
         if (hand === _svActiveHands) return;
         _svActiveHands = hand;
         _svResetJudgeState();
+        // Study gates are hand-scoped — rebuild and re-home to the current
+        // playback position when isolation changes mid-session.
+        if (_svStudyMode) {
+            _svStudyBuildGates();
+            _svStudyChordHit.clear();
+            const tNow = _svGetCurrentTime() || 0;
+            _svStudyGateIdx = 0;
+            while (_svStudyGateIdx < _svStudyGates.length - 1 &&
+                   _svStudyGates[_svStudyGateIdx].gateTime < tNow) {
+                _svStudyGateIdx++;
+            }
+            _svStudyGateTime = _svStudyGateIdx < _svStudyGates.length
+                ? _svStudyGates[_svStudyGateIdx].gateTime : null;
+            _svStudySnapCursor();
+        }
         _svUpdateHandButtons();
         _svApplyHandColors();
     }
@@ -2832,6 +2987,228 @@ function createFactory() {
         try { _svApi.render(); } catch (_) {}
     }
 
+    // ── Study mode functions ────────────────────────────────────────────
+    // Build the gate list from the judge notes: one gate per beat-position
+    // (per hand when a hand is isolated). Both-hands collapses treble + bass
+    // at the same beat into a single gate so a two-hand attack satisfies it in
+    // any order. Gates are sorted by time.
+    function _svStudyBuildGates() {
+        _svStudyGates   = [];
+        _svStudyGateIdx = 0;
+        _svStudyWrongAttempts.clear();
+        if (!_svJudgeNotesAll) return;
+        const activeHand = _svActiveHands === 'rh' ? 0 : _svActiveHands === 'lh' ? 1 : null;
+        const map = new Map();
+        for (const n of _svJudgeNotesAll) {
+            if (activeHand !== null && n.hand !== activeHand) continue;
+            const key = activeHand !== null
+                ? n.beat.absoluteDisplayStart + ':' + n.hand
+                : n.beat.absoluteDisplayStart;
+            if (!map.has(key)) map.set(key, { gateTime: n.t, entries: [] });
+            else if (n.t < map.get(key).gateTime) map.get(key).gateTime = n.t;
+            map.get(key).entries.push(n);
+        }
+        _svStudyGates = Array.from(map.values()).sort((a, b) => a.gateTime - b.gateTime);
+    }
+
+    function _svStudyGetBeatEntries() {
+        if (_svStudyGateIdx >= _svStudyGates.length) return [];
+        return _svStudyGates[_svStudyGateIdx].entries;
+    }
+
+    // Snap the cursor to the current gate's beat (study cursor follows gate
+    // position, not audio time).
+    function _svStudySnapCursor() {
+        if (_svStudyGateIdx >= _svStudyGates.length) {
+            if (_svMarker) _svMarker.style.display = 'none';
+            return;
+        }
+        const entries = _svStudyGates[_svStudyGateIdx].entries;
+        if (!entries || !entries.length) return;
+        _svLastBeat = entries[0].beat;
+        _svUpdateMarker();
+    }
+
+    // Current gate satisfied → clear its wrong-note marks, advance, resume OGG.
+    function _svStudyAdvance() {
+        _svStudyWrongAttempts.delete(_svStudyGateIdx);
+        _svRedrawAllMissDots();
+        _svStudyChordHit.clear();
+        _svStudyGateIdx++;
+        _svStudyGateTime = _svStudyGateIdx < _svStudyGates.length
+            ? _svStudyGates[_svStudyGateIdx].gateTime : null;
+        _svStudySnapCursor();
+        _svPrerollResuming = true;   // gate advance — no preroll on resume
+        try {
+            const audio = document.getElementById('audio');
+            if (audio && audio.paused) audio.play();
+        } catch (_) {}
+    }
+
+    // MIDI note-on while study mode is active: judge it against the current
+    // gate. Correct notes accumulate until the chord is complete (→ advance);
+    // wrong notes draw an X and count as a miss. Feeds the same core stats /
+    // note-detection channels as free-play judging.
+    function _svStudyHandleNoteOn(midi) {
+        if (_svStudyCountingDown) return;
+        if (_svStudyGateIdx >= _svStudyGates.length) return;
+        const entries = _svStudyGetBeatEntries();
+        const matched = entries.find(n => n.midi === midi && !_svStudyChordHit.has(n.noteKey));
+        if (matched) {
+            _svStudyChordHit.add(matched.noteKey);
+            _svHitNoteKeys.add(matched.noteKey);
+            _svHits++;
+            if (matched.hand === 0) _svHitsRH++; else _svHitsLH++;
+            _svStreak++;
+            if (_svStreak > _svBestStreak) _svBestStreak = _svStreak;
+            if (_svMissNotes.has(matched.noteKey)) {
+                _svMissNotes.delete(matched.noteKey);
+                _svRedrawAllMissDots();
+            }
+            _svUpdateScoreBadge();
+            _svNdReport(true, midi, _svNdBindingId);
+            _svEmitNoteResult(true);
+            if (entries.every(n => _svStudyChordHit.has(n.noteKey))) {
+                _svStudyAdvance();
+            }
+        } else {
+            _svMisses++;
+            _svStreak = 0;
+            _svUpdateScoreBadge();
+            _svNdReport(false, midi, _svNdBindingId);
+            _svEmitNoteResult(false);
+            if (!_svStudyWrongAttempts.has(_svStudyGateIdx))
+                _svStudyWrongAttempts.set(_svStudyGateIdx, new Set());
+            // Sequential wrong attempts replace each other; simultaneous wrong
+            // notes (still held) accumulate — evict any no longer held first.
+            const wrongSet = _svStudyWrongAttempts.get(_svStudyGateIdx);
+            for (const m of wrongSet) { if (!_svHeldNotes.has(m)) wrongSet.delete(m); }
+            wrongSet.add(midi);
+            _svRedrawAllMissDots();
+        }
+    }
+
+    function _svUpdateStudyBtn() {
+        if (!_svStudyBtnEl) return;
+        _svStudyBtnEl.textContent = _svStudyMode ? 'Study mode ✓' : 'Study mode';
+        _svStudyBtnEl.style.opacity   = _svStudyMode ? '1' : '0.7';
+        _svStudyBtnEl.style.boxShadow = _svStudyMode ? '0 0 0 1px #22c55e' : '';
+    }
+
+    // A short metronome click for the preroll countdown (own AudioContext,
+    // closed on teardown).
+    function _svStudyBeep(accent) {
+        try {
+            const AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) return;
+            if (!_svStudyAudioCtx || _svStudyAudioCtx.state === 'closed') {
+                _svStudyAudioCtx = new AudioCtx();
+            }
+            const ctx = _svStudyAudioCtx;
+            if (ctx.state === 'suspended') ctx.resume();
+            const osc  = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.frequency.value = accent ? 1400 : 900;
+            gain.gain.setValueAtTime(0.25, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.06);
+            osc.start(ctx.currentTime);
+            osc.stop(ctx.currentTime + 0.06);
+        } catch (_) {}
+    }
+
+    // One-bar count-in before playback resumes (study + preroll enabled).
+    function _svStudyStartCountdown(onDone) {
+        const score       = _svApi && _svApi.score;
+        const bpm         = (score && score.tempo) ? score.tempo : 120;
+        const mb          = score && score.masterBars && score.masterBars.length
+                            ? score.masterBars[0] : null;
+        const beatsPerBar = mb ? (mb.timeSignatureNumerator || 4) : 4;
+        const beatMs      = (60 / bpm) * 1000;
+        _svStudyCountingDown = true;
+        let beatIdx = 0;
+        _svStudyBeep(true);   // beat 1 — accent
+        beatIdx++;
+        _svStudyCountdownId = setInterval(() => {
+            if (beatIdx < beatsPerBar) {
+                _svStudyBeep(false);
+                beatIdx++;
+            } else {
+                clearInterval(_svStudyCountdownId);
+                _svStudyCountdownId  = null;
+                _svStudyCountingDown = false;
+                onDone();
+            }
+        }, beatMs);
+    }
+
+    // A platform-initiated seek (scrub bar) while study is active: re-home the
+    // gate to the seeked position and clear per-gate progress.
+    function _svStudyAttachSeekHandler() {
+        const audio = document.getElementById('audio');
+        if (!audio || _svStudySeekHandler) return;
+        _svStudySeekHandler = function () {
+            if (!_svStudyMode) return;
+            const t = audio.currentTime || 0;
+            _svStudyGateIdx = 0;
+            while (_svStudyGateIdx < _svStudyGates.length - 1 &&
+                   _svStudyGates[_svStudyGateIdx].gateTime < t) {
+                _svStudyGateIdx++;
+            }
+            _svStudyGateTime = _svStudyGateIdx < _svStudyGates.length
+                ? _svStudyGates[_svStudyGateIdx].gateTime : null;
+            _svStudyChordHit.clear();
+            _svStudyWrongAttempts.clear();
+            _svRedrawAllMissDots();
+            _svStudySnapCursor();
+        };
+        audio.addEventListener('seeked', _svStudySeekHandler);
+    }
+
+    function _svStudyDetachSeekHandler() {
+        if (!_svStudySeekHandler) return;
+        try {
+            const audio = document.getElementById('audio');
+            if (audio) audio.removeEventListener('seeked', _svStudySeekHandler);
+        } catch (_) {}
+        _svStudySeekHandler = null;
+    }
+
+    function _svStudyActivate() {
+        if (!_svJudgeNotesAll || !_svJudgeNotesAll.length) return;
+        _svStudyMode = true;
+        _svStudyChordHit.clear();
+        // Build the gate list and home to the current position — do NOT touch OGG.
+        _svStudyBuildGates();
+        const t = _svGetCurrentTime() || 0;
+        _svStudyGateIdx = 0;
+        while (_svStudyGateIdx < _svStudyGates.length - 1 &&
+               _svStudyGates[_svStudyGateIdx].gateTime < t) {
+            _svStudyGateIdx++;
+        }
+        _svStudyGateTime = _svStudyGateIdx < _svStudyGates.length
+            ? _svStudyGates[_svStudyGateIdx].gateTime : null;
+        _svStudyAttachSeekHandler();
+        _svStudySnapCursor();
+        _svUpdateStudyBtn();
+    }
+
+    function _svStudyDeactivate() {
+        if (_svStudyCountdownId !== null) {
+            clearInterval(_svStudyCountdownId);
+            _svStudyCountdownId  = null;
+            _svStudyCountingDown = false;
+        }
+        _svStudyDetachSeekHandler();
+        _svStudyMode     = false;
+        _svStudyGateTime = null;
+        _svStudyChordHit.clear();
+        _svStudyWrongAttempts.clear();
+        _svRedrawAllMissDots();
+        _svUpdateStudyBtn();
+    }
+
     // ── MIDI event handlers (called by the module-level _svMidiOnMessage,
     // routed to whichever instance is currently focused) ────────────────
 
@@ -2839,6 +3216,12 @@ function createFactory() {
         if (midi < 0 || midi > 127) return;
         _svHeldNotes.set(midi, velocity);
         _svMonitorNoteOn(midi);
+        // Study mode judges against the current gate (its own scoring/report
+        // path); free-play judges against playback time.
+        if (_svStudyMode) {
+            _svStudyHandleNoteOn(midi);
+            return;
+        }
         const t = _svGetCurrentTime();
         if (t !== null) {
             const hitKey = _svJudgeHit(midi, t);
@@ -2912,6 +3295,27 @@ function createFactory() {
         // Notation is going away — restore core's HUD to the top bar (no-op if
         // this instance wasn't the one showing notation).
         _svSetNotationShowing(instance, false);
+        // Tear down study mode: stop any countdown, detach the seek listener,
+        // reset gate state, and close the metronome AudioContext (hardware).
+        if (_svStudyCountdownId !== null) {
+            clearInterval(_svStudyCountdownId);
+            _svStudyCountdownId  = null;
+        }
+        _svStudyDetachSeekHandler();
+        _svStudyMode         = false;
+        _svStudyCountingDown = false;
+        _svStudyGates        = [];
+        _svStudyGateIdx      = 0;
+        _svStudyGateTime     = null;
+        _svStudyChordHit.clear();
+        _svStudyWrongAttempts.clear();
+        _svPrerollResuming   = false;
+        _svWasAudioPaused    = null;
+        if (_svStudyAudioCtx) {
+            try { _svStudyAudioCtx.close(); } catch (_) {}
+            _svStudyAudioCtx = null;
+        }
+        _svUpdateStudyBtn();
         _svApiReady      = false;
         _svLastTick      = -1;
         _svLastBeat      = null;
@@ -3040,6 +3444,35 @@ function createFactory() {
 
             _svSyncCursor(bundle.currentTime);
             _svSweepMisses(bundle.currentTime);
+
+            // Study mode: preroll count-in on manual play, and gate-pause when
+            // the OGG reaches the next required note.
+            try {
+                const audio = document.getElementById('audio');
+                if (audio) {
+                    const nowPaused = audio.paused;
+                    if (_svWasAudioPaused === null) {
+                        _svWasAudioPaused = nowPaused;   // first observation only
+                    } else if (!nowPaused && _svWasAudioPaused) {
+                        // paused → playing: if the user pressed play, do a preroll.
+                        if (_svStudyMode && _svPrerollEnabled
+                                && !_svPrerollResuming && !_svStudyCountingDown) {
+                            audio.pause();
+                            _svStudyStartCountdown(() => {
+                                _svPrerollResuming = true;
+                                try { audio.play(); } catch (_) {}
+                            });
+                        }
+                        _svPrerollResuming = false;
+                    }
+                    if (_svStudyMode && !_svStudyCountingDown && !audio.paused
+                            && _svStudyGateTime !== null
+                            && audio.currentTime >= _svStudyGateTime) {
+                        audio.pause();
+                    }
+                    _svWasAudioPaused = audio.paused;
+                }
+            } catch (_) {}
         },
 
         resize(/* w, h */) {

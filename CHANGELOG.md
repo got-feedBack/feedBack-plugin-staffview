@@ -10,6 +10,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Study mode** — note-by-note gated practice. A `STUDY` section in the
+  options pill toggles it on; the OGG then pauses at each gate (a beat's
+  required notes) and only resumes once they're all played correctly on MIDI.
+  - Wrong notes draw an **orange X** at the pitch actually played (clef-aware
+    ledger lines). Sequential wrong attempts replace each other while
+    simultaneous (held) wrong notes accumulate; marks clear on gate advance and
+    on seek.
+  - **Both-hands** collapses same-beat treble + bass into one gate (any order
+    satisfies it); **hand isolation** builds per-hand gates and rebuilds on
+    switch.
+  - The cursor snaps to the current gate beat (not audio time) while active.
+    Platform/click seeks re-home the gate to the seeked position.
+  - Optional **preroll count-in** (one bar of metronome clicks, persisted) when
+    playback resumes; its `AudioContext` is closed on teardown.
+  - Judged notes flow through the same core note-detection / stats channels as
+    free-play (`note:hit` / `note:miss`, `reportHit` / `reportMiss`).
+
 - **Score-surface feedback** — visual and statistical feedback layered onto
   the notation as you play.
   - **Miss-dot overlay:** a persistent `<canvas>` draws a small red dot
