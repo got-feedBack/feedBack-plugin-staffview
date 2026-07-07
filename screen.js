@@ -1776,9 +1776,54 @@ function createFactory() {
         zoomSection.appendChild(zoomRow);
         zoomSection.appendChild(resetWrap);
 
+        // ── HAND section (LH/RH isolation) ────────────────────────
+        // Hidden by default; shown only for grand-staff (≥2 staves) scores,
+        // toggled in scoreLoaded. Clicking a hand isolates it (dims the other
+        // staff + judges only that hand); clicking it again returns to Both.
+        const handSection = document.createElement('div');
+        handSection.style.cssText =
+            'margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;display:none';
+
+        const handLabel = document.createElement('span');
+        handLabel.className = 'section-practice-label';
+        handLabel.textContent = 'HAND';
+
+        const handRow = document.createElement('div');
+        handRow.className = 'section-practice-controls-row';
+        handRow.style.cssText = 'margin-top:4px;gap:6px';
+
+        const rhBtn = document.createElement('button');
+        rhBtn.type = 'button';
+        rhBtn.textContent = 'RH';
+        rhBtn.title = 'Right hand only — click again to reset to Both';
+        rhBtn.className = btnCls;
+        rhBtn.style.opacity = '0.7';
+        rhBtn.addEventListener('click',
+            () => _svSetActiveHands(_svActiveHands === 'rh' ? 'both' : 'rh'));
+
+        const lhBtn = document.createElement('button');
+        lhBtn.type = 'button';
+        lhBtn.textContent = 'LH';
+        lhBtn.title = 'Left hand only — click again to reset to Both';
+        lhBtn.className = btnCls;
+        lhBtn.style.opacity = '0.7';
+        lhBtn.addEventListener('click',
+            () => _svSetActiveHands(_svActiveHands === 'lh' ? 'both' : 'lh'));
+
+        handRow.appendChild(rhBtn);
+        handRow.appendChild(lhBtn);
+        handSection.appendChild(handLabel);
+        handSection.appendChild(handRow);
+
+        _svHandRow = handSection;
+        _svRhBtn   = rhBtn;
+        _svLhBtn   = lhBtn;
+        _svUpdateHandButtons();   // reflect current _svActiveHands
+
         popover.appendChild(midiSection);
         popover.appendChild(layoutSection);
         popover.appendChild(zoomSection);
+        popover.appendChild(handSection);
 
         // ── Toggle popover on pill click ───────────────────────────
         pill.addEventListener('click', () => {
@@ -1874,6 +1919,9 @@ function createFactory() {
         _svZoomLabel      = null;
         _svZoomMinusBtn   = null;
         _svZoomPlusBtn    = null;
+        _svHandRow        = null;
+        _svRhBtn          = null;
+        _svLhBtn          = null;
     }
 
     // ── Error banner ───────────────────────────────────────────────
@@ -2049,7 +2097,16 @@ function createFactory() {
             if (_svInitToken !== myToken) return;
             _svAtBeats  = _svBuildBeatTimeline(score);
             _svLastBeat = null;
+            // A fresh chart starts un-isolated (Both) — the new render carries
+            // no hand colouring, and a single-staff chart has no hands to split.
+            _svActiveHands = 'both';
+            _svUpdateHandButtons();
             _svBuildJudgeLists(score);
+            // Show the HAND toggles only for grand-staff (≥2 staves) scores.
+            if (_svHandRow) {
+                const staves = score.tracks && score.tracks[0] && score.tracks[0].staves;
+                _svHandRow.style.display = (staves && staves.length >= 2) ? '' : 'none';
+            }
             const seq = _svNdLoadSeq;
             _svNdOpenBindingForChart(seq);
         });
@@ -2445,23 +2502,12 @@ function createFactory() {
         _svJudgeNotesAll = all;
         _svJudgeNotesRH  = rh;
         _svJudgeNotesLH  = lh;
-        _svHitNoteKeys.clear();
-        _svMissNotes.clear();
         _svMissEntryByKey.clear();
         for (const e of all) _svMissEntryByKey.set(e.noteKey, e);
-        // Start the sweep at the current playback position so notes already
-        // in the past when the chart loads are never retroactively missed.
-        _svMissSweepIdx  = 0;
-        _svLastSweepTime = -1;
-        const now = _svGetCurrentTime();
-        if (now && now > 0) {
-            while (_svMissSweepIdx < all.length && all[_svMissSweepIdx].t < now) {
-                _svMissSweepIdx++;
-            }
-        }
-        _svHits = 0; _svMisses = 0; _svStreak = 0; _svBestStreak = 0;
-        _svHitsRH = 0; _svMissesRH = 0; _svHitsLH = 0; _svMissesLH = 0;
-        _svUpdateScoreBadge();   // resets to hidden (total is now 0)
+        // Clean slate; also re-syncs the sweep past the current playback time
+        // so notes already in the past when the chart loads are never
+        // retroactively missed.
+        _svResetJudgeState();
     }
 
     // Returns the MIDI range spanned by the loaded score's judge notes, or
@@ -2695,6 +2741,95 @@ function createFactory() {
                 _svEmitNoteResult(false);
             }
         }
+    }
+
+    // ── LH/RH hand isolation ────────────────────────────────────────────
+    // Restart the live judging session: counters, claimed sets, sweep cursor
+    // and the miss-dot canvas back to a clean slate, then re-sync the sweep
+    // cursor to the current playback position so notes already in the past are
+    // not retroactively marked missed. Shared by chart (re)load and hand
+    // switches — both change what counts, so both restart scoring.
+    function _svResetJudgeState() {
+        _svHitNoteKeys.clear();
+        _svMissNotes.clear();
+        _svMissSweepIdx  = 0;
+        _svLastSweepTime = -1;
+        _svHits = 0; _svMisses = 0; _svStreak = 0; _svBestStreak = 0;
+        _svHitsRH = 0; _svMissesRH = 0; _svHitsLH = 0; _svMissesLH = 0;
+        const now = _svGetCurrentTime();
+        if (_svJudgeNotesAll && now && now > 0) {
+            while (_svMissSweepIdx < _svJudgeNotesAll.length
+                   && _svJudgeNotesAll[_svMissSweepIdx].t < now) {
+                _svMissSweepIdx++;
+            }
+        }
+        _svRedrawAllMissDots();   // miss set is empty → clears the canvas
+        _svUpdateScoreBadge();
+    }
+
+    function _svUpdateHandButtons() {
+        if (_svRhBtn) {
+            _svRhBtn.style.opacity   = (_svActiveHands === 'rh') ? '1' : '0.7';
+            _svRhBtn.style.boxShadow = (_svActiveHands === 'rh') ? '0 0 0 1px #22c55e' : '';
+        }
+        if (_svLhBtn) {
+            _svLhBtn.style.opacity   = (_svActiveHands === 'lh') ? '1' : '0.7';
+            _svLhBtn.style.boxShadow = (_svActiveHands === 'lh') ? '0 0 0 1px #22c55e' : '';
+        }
+    }
+
+    // Switch which hand is judged ('both' | 'rh' | 'lh'). Isolating a hand
+    // changes what scores, so it restarts the session and re-colours the score.
+    function _svSetActiveHands(hand) {
+        if (hand === _svActiveHands) return;
+        _svActiveHands = hand;
+        _svResetJudgeState();
+        _svUpdateHandButtons();
+        _svApplyHandColors();
+    }
+
+    // Dim the inactive staff using alphaTab's native per-element colouring,
+    // then re-render. Colours live on the model objects, so they survive
+    // layout reflows and only need re-applying on an explicit switch (NOT from
+    // renderFinished, which would loop). Switching back to 'both' resets the
+    // styles. Grand staff only (needs ≥ 2 staves).
+    function _svApplyHandColors() {
+        if (!_svApi || !_svApiReady || !window.alphaTab) return;
+        const score = _svApi.score;
+        if (!score || !score.tracks || !score.tracks.length) return;
+        const track = score.tracks[0];
+        if (!track.staves || track.staves.length < 2) return;
+
+        const m      = window.alphaTab.model;
+        const grey   = m.Color.fromJson('#c0c0c0');
+        const dimIdx = _svActiveHands === 'rh' ? 1 : 0;
+
+        for (let si = 0; si < track.staves.length; si++) {
+            const dim = _svActiveHands !== 'both' && si === dimIdx;
+            for (const bar of track.staves[si].bars) {
+                for (const voice of bar.voices) {
+                    for (const beat of voice.beats) {
+                        if (dim) {
+                            if (!beat.style) beat.style = new m.BeatStyle();
+                            for (const k of Object.values(m.BeatSubElement))
+                                beat.style.colors.set(k, grey);
+                        } else {
+                            beat.style = new m.BeatStyle();
+                        }
+                        for (const note of beat.notes) {
+                            if (dim) {
+                                if (!note.style) note.style = new m.NoteStyle();
+                                for (const k of Object.values(m.NoteSubElement))
+                                    note.style.colors.set(k, grey);
+                            } else {
+                                note.style = new m.NoteStyle();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        try { _svApi.render(); } catch (_) {}
     }
 
     // ── MIDI event handlers (called by the module-level _svMidiOnMessage,

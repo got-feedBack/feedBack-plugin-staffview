@@ -21,6 +21,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - **Swept notes count as combined misses** — a skipped note lowers the
     combined accuracy and resets the streak, not just the per-hand tally, so
     skipping a passage can no longer read as 100%.
+  - **LH/RH hand isolation:** a `HAND` section in the options pill (shown only
+    for grand-staff scores) with `RH` / `LH` toggles. Isolating a hand dims the
+    other staff via alphaTab's native per-element colouring and judges only the
+    active hand; clicking the same button again returns to Both. Switching hand
+    restarts the scoring session (counters, miss dots, sweep cursor). A fresh
+    chart always starts un-isolated.
   - **Per-hand (RH/LH) accuracy in the live HUD:** on two-staff scores we
     inject a single `RH · LH` accuracy line as the last child of core's
     `#v3-live-performance-hud` — the per-hand split core's aggregate-only HUD
