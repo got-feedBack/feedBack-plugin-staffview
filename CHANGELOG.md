@@ -10,6 +10,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Note-detection pill controls** (restored from the pre-namespace version) —
+  a `NOTE DETECTION` section in the options pill with:
+  - **Detect** toggle — master on/off for scoring. Off = the monitor synth
+    still sounds so you can play/listen along, but nothing is judged, swept, or
+    reported to the core note-detection domain (the sweep cursor still tracks
+    the play head so re-enabling doesn't retroactively flood misses).
+  - **Clear on seek** toggle — whether seeking clears miss dots for the
+    seeked-over / replayed region (on) or leaves them in place (off).
+  - Both persisted to `localStorage`.
+
 - **Study mode** — note-by-note gated practice. A `STUDY` section in the
   options pill toggles it on; the OGG then pauses at each gate (a beat's
   required notes) and only resumes once they're all played correctly on MIDI.

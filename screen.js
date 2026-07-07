@@ -77,6 +77,8 @@ const _SV_MIDI_BLOCKLIST_RE = /midi through|^thru\b|^iac\b/i;
 const _SV_STORE_SYNTH_INST = 'staffview_synth_inst';
 const _SV_STORE_SYNTH_VOL  = 'staffview_synth_vol';
 const _SV_STORE_PREROLL    = 'staffview_preroll';
+const _SV_STORE_DETECT        = 'staffview_detect';
+const _SV_STORE_CLEAR_ON_SEEK = 'staffview_clear_on_seek';
 
 // ═══════════════════════════════════════════════════════════════════════
 // Module-level singletons
@@ -1113,6 +1115,15 @@ function createFactory() {
     let _svRhBtn        = null;
     let _svLhBtn        = null;
 
+    // ── Note-detection controls ─────────────────────────────────────
+    // _svDetectEnabled: master on/off for scoring (judging + miss sweep).
+    // Off = play/listen along with the monitor synth but no scoring/reporting.
+    // _svClearOnSeek: whether seeking clears miss dots for the seeked-over /
+    // replayed region (both defaults on, persisted).
+    let _svDetectEnabled = _svReadStore(_SV_STORE_DETECT) !== 'false';
+    let _svClearOnSeek   = _svReadStore(_SV_STORE_CLEAR_ON_SEEK) !== 'false';
+    let _svDetectBtnEl   = null;
+
     // ── Study mode ──────────────────────────────────────────────────
     // Note-by-note gated practice: the OGG pauses at each gate (a beat's
     // required notes) and only resumes once they are all played on MIDI.
@@ -1586,6 +1597,52 @@ function createFactory() {
             ? 'v3-pop-btn'
             : 'bg-dark-600 rounded-lg text-xs text-gray-300';
 
+        // ── NOTE DETECTION section ─────────────────────────────────
+        // Master scoring on/off (Detect) + whether seeking clears miss dots.
+        const ndSection = document.createElement('div');
+
+        const ndLabel = document.createElement('span');
+        ndLabel.className = 'section-practice-label';
+        ndLabel.textContent = 'NOTE DETECTION';
+
+        const ndRow = document.createElement('div');
+        ndRow.className = 'section-practice-controls-row';
+        ndRow.style.marginTop = '4px';
+
+        const detectBtn = document.createElement('button');
+        detectBtn.type = 'button';
+        detectBtn.title = 'Score your playing against the notation — off to play along without scoring';
+        detectBtn.className = btnCls;
+        detectBtn.addEventListener('click', () => {
+            _svDetectEnabled = !_svDetectEnabled;
+            _svSaveStore(_SV_STORE_DETECT, String(_svDetectEnabled));
+            _svUpdateDetectBtn();
+        });
+        _svDetectBtnEl = detectBtn;
+        _svUpdateDetectBtn();   // set label/visual from current state
+        ndRow.appendChild(detectBtn);
+
+        const clearRow = document.createElement('label');
+        clearRow.className = 'section-practice-controls-row';
+        clearRow.style.cssText = 'margin-top:6px;align-items:center;gap:6px;cursor:pointer';
+        const clearChk = document.createElement('input');
+        clearChk.type    = 'checkbox';
+        clearChk.checked = _svClearOnSeek;
+        clearChk.addEventListener('change', () => {
+            _svClearOnSeek = clearChk.checked;
+            _svSaveStore(_SV_STORE_CLEAR_ON_SEEK, String(_svClearOnSeek));
+        });
+        const clearText = document.createElement('span');
+        clearText.className = 'section-practice-label';
+        clearText.textContent = 'Clear on seek';
+        clearText.style.cssText = 'font-size:10px;opacity:0.7';
+        clearRow.appendChild(clearChk);
+        clearRow.appendChild(clearText);
+
+        ndSection.appendChild(ndLabel);
+        ndSection.appendChild(ndRow);
+        ndSection.appendChild(clearRow);
+
         // ── MIDI section ───────────────────────────────────────────
         // Device + channel picker. Always visible (not gated on a loaded
         // chart) so the user can set up their device ahead of time. The
@@ -1593,6 +1650,8 @@ function createFactory() {
         // via its shared 'sv-midi-select' class — every mounted pill's
         // select updates together.
         const midiSection = document.createElement('div');
+        midiSection.style.cssText =
+            'margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px';
 
         const midiLabel = document.createElement('span');
         midiLabel.className = 'section-practice-label';
@@ -1892,11 +1951,14 @@ function createFactory() {
         prerollRow.appendChild(prerollText);
         studySection.appendChild(prerollRow);
 
+        // Section order mirrors the legacy pill:
+        // NOTE DETECTION → STUDY → HAND → MIDI (+ Sound + Volume) → LAYOUT → ZOOM.
+        popover.appendChild(ndSection);
+        popover.appendChild(studySection);
+        popover.appendChild(handSection);
         popover.appendChild(midiSection);
         popover.appendChild(layoutSection);
         popover.appendChild(zoomSection);
-        popover.appendChild(handSection);
-        popover.appendChild(studySection);
 
         // ── Toggle popover on pill click ───────────────────────────
         pill.addEventListener('click', () => {
@@ -1996,6 +2058,7 @@ function createFactory() {
         _svRhBtn          = null;
         _svLhBtn          = null;
         _svStudyBtnEl     = null;
+        _svDetectBtnEl    = null;
     }
 
     // ── Error banner ───────────────────────────────────────────────
@@ -2826,11 +2889,15 @@ function createFactory() {
     function _svHandleSeek(newTime) {
         if (!_svJudgeNotesAll) return;
         let changed = false;
-        for (const key of _svMissNotes) {
-            const entry = _svMissEntryByKey.get(key);
-            if (entry && entry.t >= newTime) {
-                _svMissNotes.delete(key);
-                changed = true;
+        // "Clear on seek": drop miss dots for the seeked-over / replayed region
+        // so it can be re-judged fresh. When off, dots persist across seeks.
+        if (_svClearOnSeek) {
+            for (const key of _svMissNotes) {
+                const entry = _svMissEntryByKey.get(key);
+                if (entry && entry.t >= newTime) {
+                    _svMissNotes.delete(key);
+                    changed = true;
+                }
             }
         }
         for (const e of _svJudgeNotesAll) {
@@ -2863,6 +2930,15 @@ function createFactory() {
         }
         _svLastSweepTime = currentTime;
         const cutoff = currentTime - HIT_TOLERANCE_S - 0.05;
+        // Scoring disabled: don't mark misses, but keep the sweep cursor at the
+        // play head so re-enabling doesn't retroactively flood the skipped span.
+        if (!_svDetectEnabled) {
+            while (_svMissSweepIdx < _svJudgeNotesAll.length
+                   && _svJudgeNotesAll[_svMissSweepIdx].t <= cutoff) {
+                _svMissSweepIdx++;
+            }
+            return;
+        }
         const ctx = _svMissCanvas.getContext('2d');
         while (_svMissSweepIdx < _svJudgeNotesAll.length) {
             const n = _svJudgeNotesAll[_svMissSweepIdx];
@@ -3095,6 +3171,13 @@ function createFactory() {
         _svStudyBtnEl.style.boxShadow = _svStudyMode ? '0 0 0 1px #22c55e' : '';
     }
 
+    function _svUpdateDetectBtn() {
+        if (!_svDetectBtnEl) return;
+        _svDetectBtnEl.textContent = _svDetectEnabled ? 'Detect ✓' : 'Detect';
+        _svDetectBtnEl.style.opacity   = _svDetectEnabled ? '1' : '0.7';
+        _svDetectBtnEl.style.boxShadow = _svDetectEnabled ? '0 0 0 1px #22c55e' : '';
+    }
+
     // A short metronome click for the preroll countdown (own AudioContext,
     // closed on teardown).
     function _svStudyBeep(accent) {
@@ -3222,6 +3305,9 @@ function createFactory() {
             _svStudyHandleNoteOn(midi);
             return;
         }
+        // Scoring disabled — the monitor synth still sounds (above), but we
+        // don't judge or report to the note-detection domain.
+        if (!_svDetectEnabled) return;
         const t = _svGetCurrentTime();
         if (t !== null) {
             const hitKey = _svJudgeHit(midi, t);
