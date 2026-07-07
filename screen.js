@@ -18,6 +18,9 @@
 //     localStorage
 //   - Note explorer: alt+click (desktop) / double-tap (touch) a notehead
 //     shows a pitch tooltip instead of seeking; toggleable in the pill
+//   - OGG loop: click-drag (or touch-drag) across the score sets a loop
+//     region via the platform's native setLoop() API, with a green overlay
+//     that also mirrors loops set through the platform's own controls
 //
 // Module-scope singletons:
 //   - alphaTab CDN load promise (one <script> per page)
@@ -81,6 +84,34 @@ function _svSaveStore(k, v) { try { localStorage.setItem(k, String(v)); } catch 
 // math is independently testable (tests/zoom.test.js).
 function _svClampScale(value) {
     return Math.max(0.5, Math.min(2.0, Math.round(value * 20) / 20));
+}
+
+// Normalizes the two possible loop-notification payload shapes into
+// { startTime, endTime } (or null if neither is present).
+//   loop:restart        → detail = { loopA, loopB, time }
+//   playback:loop-set   → detail = { payload: { loop: { startTime, endTime, ... } }, ... }
+function _svParseLoopEventDetail(detail) {
+    const d = detail || {};
+    if (d.payload && d.payload.loop
+        && typeof d.payload.loop.startTime === 'number'
+        && typeof d.payload.loop.endTime === 'number') {
+        return { startTime: d.payload.loop.startTime, endTime: d.payload.loop.endTime };
+    }
+    if (typeof d.loopA === 'number' && typeof d.loopB === 'number') {
+        return { startTime: d.loopA, endTime: d.loopB };
+    }
+    return null;
+}
+
+// Returns [earlier, later] sorted by absoluteDisplayStart (or
+// absolutePlaybackStart) tick — used to normalize a drag gesture's
+// start/end beats regardless of which direction the user dragged.
+function _svOrderBeats(beatA, beatB) {
+    const tA = typeof beatA.absoluteDisplayStart === 'number' ? beatA.absoluteDisplayStart
+        : (typeof beatA.absolutePlaybackStart === 'number' ? beatA.absolutePlaybackStart : 0);
+    const tB = typeof beatB.absoluteDisplayStart === 'number' ? beatB.absoluteDisplayStart
+        : (typeof beatB.absolutePlaybackStart === 'number' ? beatB.absolutePlaybackStart : 0);
+    return tA <= tB ? [beatA, beatB] : [beatB, beatA];
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -544,6 +575,38 @@ function createFactory() {
     let _svLastTapX     = 0;   // canvas-space x of the previous tap
     let _svLastTapY     = 0;   // canvas-space y of the previous tap
 
+    // ── OGG loop (drag-select region + overlay) ─────────────────────
+    // _svOwnsOggLoop: true only while WE hold the platform loop (set via our
+    // own drag) — teardown/song-switch only clears a loop we set ourselves,
+    // never one the user set through the platform's own native A/B controls.
+    // _svLoopGen: bumped on every _svClearLoop() call; _svApplyOggLoop's
+    // async continuation bails if the generation moved on while it awaited
+    // the platform's setLoop() response (e.g. user cleared or re-dragged
+    // mid-request).
+    // _svLoopStartBeat/_svLoopEndBeat: the committed loop's AT Beat objects
+    // (not raw seconds) so the overlay repositions correctly across
+    // layout/zoom changes via the same boundsLookup-driven path as the
+    // playback marker.
+    let _svOwnsOggLoop   = false;
+    let _svLoopGen       = 0;
+    let _svLoopStartBeat = null;
+    let _svLoopEndBeat   = null;
+    let _svLoopMarkerA   = null;   // green bar — loop start
+    let _svLoopMarkerB   = null;   // green bar — loop end
+    let _svLoopRegionWrap = null;  // container for the region-rect divs
+    let _svLoopClearedHandler = null; // platform 'playback:loop-cleared' listener
+    let _svLoopSetHandler     = null; // platform 'playback:loop-set'/'loop:restart' listener
+
+    // Drag-select gesture state, shared between the mouse (mousedown on
+    // document mousemove/mouseup) and touch (touchstart/touchmove/touchend)
+    // paths so both funnel into the same _svApplyOggLoop() call.
+    let _svDragArmed        = false;
+    let _svDragActive       = false;   // 14px (mouse: 8px) threshold crossed
+    let _svDragStartClientX = 0;
+    let _svDragStartClientY = 0;
+    let _svDragBeat         = null;
+    let _svDragCleanup      = null;    // fn to remove the dynamic mousemove/mouseup pair
+
     // ── Layout mode and zoom (persisted, read once at factory creation) ────
     // Stored as plain values so instance creation doesn't touch alphaTab
     // (not loaded yet) — applied to the AlphaTabApi settings in _svInitAlphaTab.
@@ -630,6 +693,13 @@ function createFactory() {
         // Disables the browser's native double-tap zoom so the touchend
         // handler below can use double-tap for the note explorer.
         inner.style.touchAction = 'manipulation';
+        // Prevents iOS's text-selection magnifier from firing when a finger
+        // drags across the notation surface (SVG — nothing meaningful to
+        // select). Belt-and-suspenders: the touchmove drag handler below
+        // also calls preventDefault() once a horizontal drag is confirmed.
+        inner.style.userSelect       = 'none';
+        inner.style.webkitUserSelect = 'none';
+        inner.addEventListener('selectstart', (e) => e.preventDefault());
         c.appendChild(inner);
 
         // Playback marker — boundsLookup-driven (slopsmith#734 pattern).
@@ -650,19 +720,50 @@ function createFactory() {
         ].join(';');
         c.appendChild(marker);
 
-        mount.appendChild(c);
-        _svContainer = c;
-        _svAtMount   = inner;
-        _svMarker    = marker;
+        // Loop overlay: green A/B marker bars + a region-rect wrapper,
+        // initially hidden (Group B1-a).
+        function _mkLoopMarker(label) {
+            const m = document.createElement('div');
+            m.style.cssText = [
+                'position:absolute', 'top:0', 'left:0', 'width:2px', 'height:0',
+                'background:#22c55e', 'pointer-events:none', 'z-index:998', 'display:none',
+            ].join(';');
+            const badge = document.createElement('span');
+            badge.textContent = label;
+            badge.style.cssText = [
+                'position:absolute', 'top:0', 'left:3px',
+                'font-size:10px', 'color:#22c55e', 'font-family:monospace',
+                'font-weight:bold', 'line-height:1', 'pointer-events:none',
+            ].join(';');
+            m.appendChild(badge);
+            return m;
+        }
+        const loopMarkerA    = _mkLoopMarker('A');
+        const loopMarkerB    = _mkLoopMarker('B');
+        const loopRegionWrap = document.createElement('div');
+        loopRegionWrap.style.cssText =
+            'position:absolute;top:0;left:0;pointer-events:none;z-index:997;overflow:visible;';
+        c.appendChild(loopMarkerA);
+        c.appendChild(loopMarkerB);
+        c.appendChild(loopRegionWrap);
 
-        // ── Click-to-seek / note explorer ───────────────────────────
-        // mousedown on the score div: resolve the clicked position to a
-        // beat via boundsLookup.getBeatAtPos(). Alt+click shows the note
-        // explorer's pitch tooltip instead of seeking; a plain click always
-        // seeks the OGG audio element (currentTime) via the bundle.beats
-        // time stream.
+        mount.appendChild(c);
+        _svContainer      = c;
+        _svAtMount        = inner;
+        _svMarker         = marker;
+        _svLoopMarkerA    = loopMarkerA;
+        _svLoopMarkerB    = loopMarkerB;
+        _svLoopRegionWrap = loopRegionWrap;
+
+        // ── Interaction model ────────────────────────────────────────
+        //   Alt+click        → note explorer pitch tooltip
+        //   Drag (> 8px)      → set loop region (drag-select)
+        //   Short click       → seek cursor
+        // mousedown arms drag state; dynamic mousemove/mouseup listeners on
+        // document decide the outcome once the gesture completes (mirrors
+        // the pill's own bounded-retry style of deferred decision-making).
         inner.addEventListener('mousedown', (e) => {
-            if (!_svApi || !_svApiReady) return;
+            if (e.button !== 0 || !_svApi || !_svApiReady) return;
             const bl = _svApi.boundsLookup;
             if (!bl || typeof bl.getBeatAtPos !== 'function') return;
 
@@ -676,8 +777,9 @@ function createFactory() {
             try { beat = bl.getBeatAtPos(x, y); } catch (_) { return; }
             if (!beat) return;
 
-            // Alt+click → note explorer tooltip; suppresses seek for this
-            // click (no-op, falls through to nothing, if the beat is a rest).
+            // Alt+click → note explorer tooltip; suppresses seek/drag for
+            // this click (no-op, falls through to nothing, if the beat is
+            // a rest).
             if (e.altKey && _svNoteExplorerEnabled) {
                 if (beat.notes && beat.notes.length > 0) {
                     _svShowNoteTooltip(beat, x, y);
@@ -685,23 +787,83 @@ function createFactory() {
                 return;
             }
 
-            const tick = typeof beat.absoluteDisplayStart === 'number'
-                ? beat.absoluteDisplayStart
-                : (typeof beat.absolutePlaybackStart === 'number'
-                    ? beat.absolutePlaybackStart : null);
-            if (tick === null) return;
+            // Cancel any stale drag listeners from a previous gesture.
+            if (_svDragCleanup) { _svDragCleanup(); _svDragCleanup = null; }
 
-            // Update our cursor immediately.
-            _svLastTick = tick;
-            _svLastBeat = beat;
-            _svUpdateMarker();
+            _svDragArmed        = true;
+            _svDragActive       = false;
+            _svDragStartClientX = e.clientX;
+            _svDragStartClientY = e.clientY;
+            _svDragBeat         = beat;
 
-            // Seek the OGG audio element.
-            const secs = _svBeatToSeconds(beat);
-            if (secs !== null) {
-                const audio = document.getElementById('audio');
-                if (audio) { try { audio.currentTime = secs; } catch (_) {} }
-            }
+            const onMove = (ev) => {
+                if (!_svDragArmed) return;
+                if (!_svDragActive) {
+                    const dx = ev.clientX - _svDragStartClientX;
+                    const dy = ev.clientY - _svDragStartClientY;
+                    if (Math.hypot(dx, dy) <= 8) return;
+                    _svDragActive = true;
+                }
+                const bll = _svApi && _svApi.boundsLookup;
+                if (!bll || typeof bll.getBeatAtPos !== 'function') return;
+                const rc  = inner.getBoundingClientRect();
+                const cx  = ev.clientX - rc.left + inner.scrollLeft;
+                const cy  = ev.clientY - rc.top  + inner.scrollTop;
+                let endBeat;
+                try { endBeat = bll.getBeatAtPos(cx, cy); } catch (_) { return; }
+                if (endBeat) _svDrawLoopPreview(_svDragBeat, endBeat);
+            };
+
+            const onUp = (ev) => {
+                _svDragCleanup && _svDragCleanup();
+                _svDragCleanup = null;
+
+                const wasActive = _svDragActive;
+                const startBeat = _svDragBeat;
+                _svDragArmed  = false;
+                _svDragActive = false;
+                _svDragBeat   = null;
+                _svClearLoopPreview();
+
+                if (!startBeat || !_svApi || !_svApiReady) return;
+
+                if (wasActive) {
+                    // Drag → set loop.
+                    const bll = _svApi && _svApi.boundsLookup;
+                    if (!bll || typeof bll.getBeatAtPos !== 'function') return;
+                    const rc = inner.getBoundingClientRect();
+                    const ex = ev.clientX - rc.left + inner.scrollLeft;
+                    const ey = ev.clientY - rc.top  + inner.scrollTop;
+                    let endBeat;
+                    try { endBeat = bll.getBeatAtPos(ex, ey); } catch (_) {}
+                    if (!endBeat) endBeat = startBeat;
+                    const [beatA, beatB] = _svOrderBeats(startBeat, endBeat);
+                    _svApplyOggLoop(beatA, beatB);
+                } else {
+                    // Short click → seek.
+                    const beat2 = startBeat;
+                    const tick = typeof beat2.absoluteDisplayStart === 'number'
+                        ? beat2.absoluteDisplayStart
+                        : (typeof beat2.absolutePlaybackStart === 'number'
+                            ? beat2.absolutePlaybackStart : null);
+                    if (tick === null) return;
+                    _svLastTick = tick;
+                    _svLastBeat = beat2;
+                    _svUpdateMarker();
+                    const secs = _svBeatToSeconds(beat2);
+                    if (secs !== null) {
+                        const audio = document.getElementById('audio');
+                        if (audio) { try { audio.currentTime = secs; } catch (_) {} }
+                    }
+                }
+            };
+
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup',   onUp);
+            _svDragCleanup = () => {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup',   onUp);
+            };
         });
 
         // Double-tap → note explorer (mobile equivalent of alt+click; touch
@@ -737,6 +899,91 @@ function createFactory() {
                 _svLastTapY    = y;
             }
         });
+
+        // Touch drag → loop region (mobile equivalent of the mouse drag
+        // above). touchstart arms the drag using the same shared state vars
+        // as the mousedown path. The dead zone is wider than the mouse path
+        // (14px vs 8px) to absorb natural finger tremor, and a
+        // predominantly-vertical first movement disarms the drag and yields
+        // to native container scroll instead of hijacking it —
+        // preventDefault() only fires once a horizontal drag is confirmed.
+        // touchend with an active drag calls preventDefault() to suppress
+        // the synthetic mousedown/click the browser would otherwise
+        // generate, so the loop gesture isn't immediately followed by an
+        // accidental seek. Single taps fall through to the existing
+        // synthesized mousedown handler unchanged.
+        inner.addEventListener('touchstart', (e) => {
+            if (!_svApi || !_svApiReady) return;
+            const t = e.touches[0];
+            if (!t) return;
+            const bl = _svApi.boundsLookup;
+            if (!bl || typeof bl.getBeatAtPos !== 'function') return;
+            const rect = inner.getBoundingClientRect();
+            const x = t.clientX - rect.left + inner.scrollLeft;
+            const y = t.clientY - rect.top  + inner.scrollTop;
+            let beat;
+            try { beat = bl.getBeatAtPos(x, y); } catch (_) { return; }
+            if (!beat) return;
+            if (_svDragCleanup) { _svDragCleanup(); _svDragCleanup = null; }
+            _svDragArmed        = true;
+            _svDragActive       = false;
+            _svDragStartClientX = t.clientX;
+            _svDragStartClientY = t.clientY;
+            _svDragBeat         = beat;
+        }, { passive: true });
+
+        inner.addEventListener('touchmove', (e) => {
+            if (!_svDragArmed) return;
+            const t = e.touches[0];
+            if (!t) return;
+            if (!_svDragActive) {
+                const dx = t.clientX - _svDragStartClientX;
+                const dy = t.clientY - _svDragStartClientY;
+                if (Math.hypot(dx, dy) <= 14) return;
+                // Vertical intent → disarm and yield to native scroll.
+                if (Math.abs(dy) > Math.abs(dx)) {
+                    _svDragArmed = false;
+                    _svDragBeat  = null;
+                    return;
+                }
+                _svDragActive = true;
+            }
+            e.preventDefault(); // stop iOS scroll and selection once horizontal drag is confirmed
+            const bll = _svApi && _svApi.boundsLookup;
+            if (!bll || typeof bll.getBeatAtPos !== 'function') return;
+            const rc = inner.getBoundingClientRect();
+            const cx = t.clientX - rc.left + inner.scrollLeft;
+            const cy = t.clientY - rc.top  + inner.scrollTop;
+            let endBeat;
+            try { endBeat = bll.getBeatAtPos(cx, cy); } catch (_) { return; }
+            if (endBeat) _svDrawLoopPreview(_svDragBeat, endBeat);
+        }, { passive: false });
+
+        inner.addEventListener('touchend', (e) => {
+            if (!_svDragArmed) return;
+            const wasActive = _svDragActive;
+            const startBeat = _svDragBeat;
+            _svDragArmed  = false;
+            _svDragActive = false;
+            _svDragBeat   = null;
+            _svClearLoopPreview();
+            if (!wasActive || !startBeat || !_svApi || !_svApiReady) return;
+            // Suppress synthetic mousedown/click so the drag isn't followed
+            // by an accidental seek.
+            e.preventDefault();
+            const t = e.changedTouches[0];
+            if (!t) return;
+            const bll = _svApi && _svApi.boundsLookup;
+            if (!bll || typeof bll.getBeatAtPos !== 'function') return;
+            const rc = inner.getBoundingClientRect();
+            const ex = t.clientX - rc.left + inner.scrollLeft;
+            const ey = t.clientY - rc.top  + inner.scrollTop;
+            let endBeat;
+            try { endBeat = bll.getBeatAtPos(ex, ey); } catch (_) {}
+            if (!endBeat) endBeat = startBeat;
+            const [beatA, beatB] = _svOrderBeats(startBeat, endBeat);
+            _svApplyOggLoop(beatA, beatB);
+        }, { passive: false });
 
         // ResizeObserver on controls bar so bottom inset stays correct
         // when the bar wraps to a second row (main-player only).
@@ -792,9 +1039,12 @@ function createFactory() {
                 _svPrevMountPos = null;
             }
             _svContainer.remove();
-            _svContainer = null;
-            _svAtMount   = null;
-            _svMarker    = null;
+            _svContainer      = null;
+            _svAtMount        = null;
+            _svMarker         = null;
+            _svLoopMarkerA    = null;
+            _svLoopMarkerB    = null;
+            _svLoopRegionWrap = null;
         }
     }
 
@@ -870,6 +1120,237 @@ function createFactory() {
         _svTooltipTimer   = setTimeout(_svTooltipDismissAll, 4000);
         _svTooltipDismiss = () => _svTooltipDismissAll();
         document.addEventListener('mousedown', _svTooltipDismiss, { capture: true, once: true });
+    }
+
+    // ── OGG loop helpers ─────────────────────────────────────────────
+
+    // Inverse of _svBeatToSeconds. bundle.beats[i] is the time at tick i*960
+    // (one entry per quarter-note beat, same assumption _svBeatToSeconds
+    // uses). Binary-search _svLatestBeats for the time, interpolate a
+    // fractional beat index, convert to tick = (idx+frac)*960, then look up
+    // the AT Beat via _svFindBeatAtTick. Used to mirror a loop set through
+    // the platform's own native controls (seconds) into our AT-Beat-based
+    // overlay.
+    function _svTimeToNearestBeat(time) {
+        const lb = _svLatestBeats;
+        if (!lb || lb.length < 2) return null;
+        if (time <= lb[0].time) return _svFindBeatAtTick(0);
+        let lo = 0, hi = lb.length - 1, idx = 0;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (lb[mid].time <= time) { idx = mid; lo = mid + 1; }
+            else { hi = mid - 1; }
+        }
+        let frac = 0;
+        if (idx < lb.length - 1) {
+            const t0 = lb[idx].time, t1 = lb[idx + 1].time;
+            if (t1 > t0) frac = Math.min(1, (time - t0) / (t1 - t0));
+        }
+        return _svFindBeatAtTick(Math.round((idx + frac) * 960));
+    }
+
+    // Creates a single region-rect element (absolutely positioned in
+    // _svContainer space).
+    function _svMakeRegionRect(left, top, width, height) {
+        const d = document.createElement('div');
+        d.style.cssText = [
+            'position:absolute',
+            'background:rgba(34,197,94,0.12)',
+            'border-top:1px solid rgba(34,197,94,0.3)',
+            'border-bottom:1px solid rgba(34,197,94,0.3)',
+            'pointer-events:none',
+            'left:' + left + 'px',
+            'top:'  + top  + 'px',
+            'width:'  + width  + 'px',
+            'height:' + height + 'px',
+        ].join(';');
+        return d;
+    }
+
+    // Positions a single loop marker (A or B) at the given beat.
+    function _svPositionLoopMarker(marker, beat, side) {
+        if (!marker || !_svAtMount) return false;
+        const bl = _svApi && _svApi.boundsLookup;
+        if (!bl || typeof bl.findBeat !== 'function') return false;
+        const bb = bl.findBeat(beat);
+        if (!bb || !bb.visualBounds) return false;
+        const vb = bb.visualBounds;
+        let sysTop = vb.y, sysH = vb.h;
+        try {
+            const systems = bl.staffSystems || [];
+            for (const sys of systems) {
+                const svb = sys && sys.visualBounds;
+                if (!svb) continue;
+                if (vb.y >= svb.y && vb.y < svb.y + svb.h) {
+                    sysTop = svb.y; sysH = svb.h; break;
+                }
+            }
+        } catch (_) {}
+        const baseX = _svAtMount.offsetLeft;
+        const baseY = _svAtMount.offsetTop;
+        const left  = Math.round(baseX + (side === 'B' ? vb.x + vb.w : vb.x));
+        marker.style.left    = left + 'px';
+        marker.style.top     = Math.round(baseY + sysTop) + 'px';
+        marker.style.height  = Math.round(sysH) + 'px';
+        marker.style.display = '';
+        return true;
+    }
+
+    // Positions both loop markers and fills the region rects for
+    // beatA → beatB, spanning multiple staff-system rows when the loop
+    // crosses a line break.
+    function _svUpdateLoopOverlay(beatA, beatB) {
+        if (!_svLoopMarkerA || !_svLoopMarkerB || !_svLoopRegionWrap || !_svAtMount) return;
+        if (!beatA && !beatB) { _svHideLoopOverlay(); return; }
+
+        // Partial state (drag in progress with only a start beat yet, or
+        // A/B set independently by the platform's own controls before the
+        // pair is complete) — show just the one marker.
+        if (!beatA || !beatB) {
+            _svHideLoopOverlay();
+            if (beatA) _svPositionLoopMarker(_svLoopMarkerA, beatA, 'A');
+            else       _svPositionLoopMarker(_svLoopMarkerB, beatB, 'B');
+            return;
+        }
+
+        const bl = _svApi && _svApi.boundsLookup;
+        if (!bl || typeof bl.findBeat !== 'function') { _svHideLoopOverlay(); return; }
+
+        const bbA = bl.findBeat(beatA);
+        const bbB = bl.findBeat(beatB);
+        if (!bbA || !bbA.visualBounds || !bbB || !bbB.visualBounds) {
+            _svHideLoopOverlay(); return;
+        }
+
+        const vbA   = bbA.visualBounds;
+        const vbB   = bbB.visualBounds;
+        const baseX = _svAtMount.offsetLeft;
+        const baseY = _svAtMount.offsetTop;
+
+        // Collect sorted staffSystem rows.
+        const rows = [];
+        try {
+            const systems = bl.staffSystems || [];
+            for (const sys of systems) {
+                if (sys && sys.visualBounds) rows.push(sys.visualBounds);
+            }
+            rows.sort((a, b) => a.y - b.y);
+        } catch (_) {}
+
+        function findRow(vb) {
+            for (const r of rows) {
+                if (vb.y >= r.y && vb.y < r.y + r.h) return r;
+            }
+            return null;
+        }
+
+        const rowA = findRow(vbA);
+        const rowB = findRow(vbB);
+
+        _svPositionLoopMarker(_svLoopMarkerA, beatA, 'A');
+        _svPositionLoopMarker(_svLoopMarkerB, beatB, 'B');
+
+        _svLoopRegionWrap.innerHTML = '';
+
+        if (!rowA || !rowB || rowA === rowB || Math.abs(rowA.y - rowB.y) < 1) {
+            // Same system row.
+            const left   = Math.round(baseX + Math.min(vbA.x, vbB.x));
+            const right  = Math.round(baseX + Math.max(vbA.x + vbA.w, vbB.x + vbB.w));
+            const top    = Math.round(baseY + (rowA ? rowA.y : Math.min(vbA.y, vbB.y)));
+            const height = Math.round(rowA ? rowA.h : Math.max(vbA.h, vbB.h));
+            if (right > left) {
+                _svLoopRegionWrap.appendChild(_svMakeRegionRect(left, top, right - left, height));
+            }
+        } else {
+            // Multi-row: span from rowA.y to rowB.y inclusive, one region
+            // rect per row, clipped to the loop's start/end column on the
+            // first/last row respectively.
+            const spanned = rows.filter(r => r.y >= rowA.y && r.y <= rowB.y);
+            for (const row of spanned) {
+                let left, right;
+                if (Math.abs(row.y - rowA.y) < 1) {
+                    left  = Math.round(baseX + vbA.x);
+                    right = Math.round(baseX + row.x + row.w);
+                } else if (Math.abs(row.y - rowB.y) < 1) {
+                    left  = Math.round(baseX + row.x);
+                    right = Math.round(baseX + vbB.x + vbB.w);
+                } else {
+                    left  = Math.round(baseX + row.x);
+                    right = Math.round(baseX + row.x + row.w);
+                }
+                const top    = Math.round(baseY + row.y);
+                const height = Math.round(row.h);
+                if (right > left) {
+                    _svLoopRegionWrap.appendChild(
+                        _svMakeRegionRect(left, top, right - left, height));
+                }
+            }
+        }
+    }
+
+    function _svHideLoopOverlay() {
+        if (_svLoopMarkerA)    _svLoopMarkerA.style.display = 'none';
+        if (_svLoopMarkerB)    _svLoopMarkerB.style.display = 'none';
+        if (_svLoopRegionWrap) _svLoopRegionWrap.innerHTML  = '';
+    }
+
+    function _svDrawLoopPreview(startBeat, endBeat) {
+        if (!startBeat || !endBeat) return;
+        const [beatA, beatB] = _svOrderBeats(startBeat, endBeat);
+        _svUpdateLoopOverlay(beatA, beatB);
+    }
+
+    // After a drag ends without committing (or is cancelled): restore
+    // whatever loop state was already committed, or hide if none.
+    function _svClearLoopPreview() {
+        _svUpdateLoopOverlay(_svLoopStartBeat, _svLoopEndBeat);
+    }
+
+    // Applies a loop via the platform's native setLoop() API. Shows the
+    // overlay immediately (optimistic); rolls back to the previously
+    // committed state if the platform rejects the request.
+    async function _svApplyOggLoop(beatA, beatB) {
+        const timeA = _svBeatToSeconds(beatA);
+        const timeB = _svBeatToSeconds(beatB);
+        if (timeA === null || timeB === null) return;
+
+        // Capture the generation so a concurrent _svClearLoop (or a second,
+        // faster drag) can invalidate this continuation.
+        const gen = ++_svLoopGen;
+
+        _svUpdateLoopOverlay(beatA, beatB);
+
+        let result;
+        try { result = await window.feedBack.setLoop(timeA, timeB); }
+        catch (_) { result = false; }
+
+        if (gen !== _svLoopGen) return;
+
+        if (result === false) {
+            _svUpdateLoopOverlay(_svLoopStartBeat, _svLoopEndBeat);
+            return;
+        }
+
+        _svOwnsOggLoop   = true;
+        _svLoopStartBeat = beatA;
+        _svLoopEndBeat   = beatB;
+        _svUpdateLoopOverlay(beatA, beatB);
+    }
+
+    // Clears a loop WE set. Never clears a loop the platform's own native
+    // controls set (_svOwnsOggLoop stays false in that case) — teardown/
+    // song-switch should not steal a loop the user set through the
+    // platform's own UI.
+    function _svClearLoop() {
+        _svLoopGen++;   // invalidate any pending _svApplyOggLoop continuation
+
+        if (_svOwnsOggLoop) {
+            try { window.feedBack.clearLoop(); } catch (_) {}
+            _svOwnsOggLoop = false;
+        }
+        _svLoopStartBeat = null;
+        _svLoopEndBeat   = null;
+        _svHideLoopOverlay();
     }
 
     // ── Layout mode and zoom controls ───────────────────────────────
@@ -1487,8 +1968,10 @@ function createFactory() {
             _svFailedArr  = null;
             _svRemoveErrorBanner();
 
-            // Re-place marker after each layout (boundsLookup is freshly valid).
+            // Re-place marker and loop overlay after each layout (boundsLookup
+            // is freshly valid).
             _svUpdateMarker();
+            _svUpdateLoopOverlay(_svLoopStartBeat, _svLoopEndBeat);
         });
 
         // ── alphaTab error ────────────────────────────────────────
@@ -1515,6 +1998,47 @@ function createFactory() {
         if (_svRendered || !_svNotationReady || !_svInfo || _svMeasures.length === 0) return;
         if (_svInitToken !== myToken) return;
         _svRendered = true;
+
+        // Register platform loop listeners for the full session lifetime.
+        // loop-cleared: hide the overlay when the platform clears the loop
+        // (regardless of who set it). loop-set / loop:restart: mirror a
+        // loop set through the platform's own native controls (or a
+        // restored saved loop) onto our score overlay — without this, the
+        // overlay only ever reflects loops WE set via drag.
+        if (window.feedBack && typeof window.feedBack.on === 'function') {
+            if (_svLoopClearedHandler) {
+                window.feedBack.off('playback:loop-cleared', _svLoopClearedHandler);
+            }
+            _svLoopClearedHandler = () => {
+                if (_svInitToken !== myToken) return;
+                _svOwnsOggLoop   = false;
+                _svLoopStartBeat = null;
+                _svLoopEndBeat   = null;
+                _svHideLoopOverlay();
+            };
+            window.feedBack.on('playback:loop-cleared', _svLoopClearedHandler);
+
+            if (_svLoopSetHandler) {
+                window.feedBack.off('playback:loop-set', _svLoopSetHandler);
+                window.feedBack.off('loop:restart',      _svLoopSetHandler);
+            }
+            _svLoopSetHandler = (ev) => {
+                if (_svInitToken !== myToken) return;
+                // window.feedBack events are DOM CustomEvents — data lives
+                // in ev.detail. _svParseLoopEventDetail normalizes the two
+                // possible shapes (see its own doc comment).
+                const loop = _svParseLoopEventDetail(ev && ev.detail);
+                if (!loop) return;
+                const beatA = _svTimeToNearestBeat(loop.startTime);
+                const beatB = _svTimeToNearestBeat(loop.endTime);
+                if (!beatA || !beatB) return;
+                _svLoopStartBeat = beatA;
+                _svLoopEndBeat   = beatB;
+                _svUpdateLoopOverlay(beatA, beatB);
+            };
+            window.feedBack.on('playback:loop-set', _svLoopSetHandler);
+            window.feedBack.on('loop:restart',      _svLoopSetHandler);
+        }
 
         const container = _svCreateContainer();
         if (!container) {
@@ -1781,6 +2305,25 @@ function createFactory() {
         _svMeasures      = [];
         _svNotationReady = false;
         _svRendered      = false;
+
+        // Cancel any in-flight drag gesture.
+        if (_svDragCleanup) { _svDragCleanup(); _svDragCleanup = null; }
+        _svDragArmed = false; _svDragActive = false; _svDragBeat = null;
+
+        // Clear a loop WE set and hide the overlay (_svClearLoop() is a
+        // no-op on the platform side if the platform's own controls set the
+        // current loop — _svOwnsOggLoop stays false in that case).
+        _svClearLoop();
+
+        if (window.feedBack && typeof window.feedBack.off === 'function') {
+            if (_svLoopClearedHandler) window.feedBack.off('playback:loop-cleared', _svLoopClearedHandler);
+            if (_svLoopSetHandler) {
+                window.feedBack.off('playback:loop-set', _svLoopSetHandler);
+                window.feedBack.off('loop:restart',      _svLoopSetHandler);
+            }
+        }
+        _svLoopClearedHandler = null;
+        _svLoopSetHandler     = null;
 
         _svCloseWs();
 
