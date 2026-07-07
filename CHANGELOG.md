@@ -8,6 +8,57 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Options pill: LAYOUT and ZOOM controls** — reintroduces the ♩ Staff View
+  pill removed alongside alphaSynth playback, now carrying only non-playback
+  formatting controls. Mounts into the v3 plugin-control slot
+  (`feedBack.ui.playerControlSlot()`, with a bounded poll + one-shot
+  `MutationObserver` fallback for a not-yet-mounted slot), the v2
+  `#player-footer`, or the splitscreen panel — using the platform's
+  `.section-practice-pill` / `.section-practice-control` CSS classes so it
+  looks native in both UI versions. The popover's outside-click listener is
+  torn down on `_svRemovePill()` even if left open, so a mid-popover
+  teardown never leaves a dangling `document`-level capture listener.
+  - **LAYOUT** — `[Page]` / `[Horiz]` toggle `alphaTab.LayoutMode` with a
+    full re-render; horizontal mode vertically centres the (single-row)
+    staff in the container via flexbox, with an explicit `width:100%` on
+    the inner mount div so alphaTab doesn't measure a 0-width flex child
+    and skip rendering.
+  - **ZOOM** — `[−]` / `[+]` adjust score scale in 5% steps, clamped
+    50%–200% (`_svClampScale`, unit-tested), with a percentage readout and
+    a reset-to-100% link.
+  - Both persisted to `localStorage` (`staffview_layout`, `staffview_scale`)
+    and read once at instance creation, applied as the `AlphaTabApi` initial
+    `display.layoutMode` / `display.scale` (replacing the previous hardcoded
+    `Page` / `0.9`).
+  - Popover height is clamped to the visible viewport (`window.innerHeight`,
+    not `vh`, since `vh` includes browser chrome) and capped at
+    `max-height:80vh` with scroll, so it never runs off-screen on mobile.
+
+### Fixed
+
+- **Playback marker stale after LAYOUT/ZOOM change while paused** — a
+  settings-only `updateSettings()`+`render()` (no score reload) doesn't
+  reliably leave alphaTab's `boundsLookup` and the container's flex-centring
+  reflow both settled by the time `renderFinished` fires; measured
+  empirically, toggling layout could leave the marker positioned against
+  bounds frozen from the *previous* layout, or against an unsettled
+  container offset, invisible until the next play/seek forced a recompute.
+  While playing, `_svSyncCursor` already re-triggers on every frame and
+  papers over it — the bug only shows while paused. How long settling takes
+  scales with the machine's speed and the score's layout complexity (note
+  density, page/system count), not elapsed time, so any *fixed* delay —
+  frame-count or wall-clock — can in principle still be too short on a slow
+  enough machine or dense enough score. `_svSetLayout`/`_svSetScale` now
+  poll `_svUpdateMarker()` (150ms interval, mirroring the pill's own
+  bounded slot-retry pattern) and stop as soon as the marker's own computed
+  position stops changing between two consecutive polls — the actual
+  settlement signal — rather than after a fixed number of tries. A generous
+  80-try (~12s) cap remains only as a safety net against a pathological
+  case, not as the intended stop condition; the interval is cleared on
+  teardown.
+
 ### Removed
 
 - **alphaSynth playback** — AlphaTab playback is scrapped in favour of
