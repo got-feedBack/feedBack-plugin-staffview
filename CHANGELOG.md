@@ -10,6 +10,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Score-surface feedback** — visual and statistical feedback layered onto
+  the notation as you play.
+  - **Miss-dot overlay:** a persistent `<canvas>` draws a small red dot
+    (`#ef4444`, r=2 px) immediately left of any notehead whose hit window
+    passes without a matching MIDI note. A monotonic sweep runs on each
+    playback frame; a backward seek / replay clears dots for the replayed
+    region and re-judges those notes ("overwrite on replay"), and re-hitting
+    a previously-missed note erases its dot.
+  - **Swept notes count as combined misses** — a skipped note lowers the
+    combined accuracy and resets the streak, not just the per-hand tally, so
+    skipping a passage can no longer read as 100%.
+  - **Per-hand (RH/LH) accuracy in the live HUD:** on two-staff scores we
+    inject a single `RH · LH` accuracy line as the last child of core's
+    `#v3-live-performance-hud` — the per-hand split core's aggregate-only HUD
+    can't surface. Core only writes `textContent` to its own child ids and
+    never rebuilds the box, so the injected line is safe; it's removed when
+    staffview stops showing notation. v3-only (no standalone badge; the v2
+    legacy UI has no live scoreboard).
+  - **Core stats bridge:** judged hits/misses emit `note:hit` / `note:miss`
+    on `window.feedBack`, feeding core's `stats-recorder` /
+    `live-performance-hud` / song_stats so staffview scoring shows up in the
+    shared live HUD and dashboard (score/accuracy per `lib/song_score.py`).
+  - **Core HUD repositioning:** while a staffview view is showing notation,
+    core's `#v3-live-performance-hud` (now carrying our per-hand line) is moved
+    from the top bar — where it overlaps the grand staff — down to the
+    bottom-right. Scoped by a `staffview-notation-active` class the plugin
+    toggles on its own show/teardown triggers (added on `renderFinished`,
+    removed on teardown / render error) so it never affects other vizs; the
+    move is one injected CSS rule and only applies in v3.
+  - `_svAccuracyPct` (hits, misses → percentage, matching `lib/song_score.py`)
+    extracted as a pure, unit-tested module-level helper.
+
 - **Monitor synth — hear your MIDI keyboard** — a WebAudioFont-based synth
   plays back what you play on the connected MIDI keyboard, since core has
   no keyboard-tone synth of its own (keyboard tones are new ground in the
