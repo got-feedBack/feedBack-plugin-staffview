@@ -24,6 +24,11 @@
 //     staffview owns judgment, the domain only carries the result.
 //   - Monitor synth (WebAudioFont, own CDN) plays back the connected MIDI
 //     keyboard; a mixer fader and pill Sound/Volume controls tune it
+//   - Note explorer: alt+click (desktop) / double-tap (touch) a notehead
+//     shows a pitch tooltip instead of seeking; toggleable in the pill
+//   - OGG loop: click-drag (or touch-drag) across the score sets a loop
+//     region via the platform's native setLoop() API, with a green overlay
+//     that also mirrors loops set through the platform's own controls
 //
 // Module-scope singletons:
 //   - alphaTab CDN load promise (one <script> per page)
@@ -73,6 +78,16 @@ const ND_PROVIDER_ID = 'staffview-midi';
 // filter, kept here too since a saved pick predating that filter could
 // still resolve to one.
 const _SV_MIDI_BLOCKLIST_RE = /midi through|^thru\b|^iac\b/i;
+const _SV_STORE_NOTE_EXPLORER  = 'staffview_note_explorer';
+
+// Pitch name lookup tables for _svPitchLabel(), keyed by MIDI pitch class
+// (note.tone, 0-11). Sharp spelling used when key signature >= 0 or
+// accidentalMode is ForceSharp; flat spelling when key signature < 0 or
+// accidentalMode is ForceFlat.
+const _SV_NOTE_EN_S  = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const _SV_NOTE_SOL_S = ['DO','DO#','RE','RE#','MI','FA','FA#','SOL','SOL#','LA','LA#','SI'];
+const _SV_NOTE_EN_F  = ['C','Db','D','Eb','E','F','Gb','G','Ab','A','Bb','B'];
+const _SV_NOTE_SOL_F = ['DO','REb','RE','MIb','MI','FA','SOLb','SOL','LAb','LA','SIb','SI'];
 
 const _SV_STORE_SYNTH_INST = 'staffview_synth_inst';
 const _SV_STORE_SYNTH_VOL  = 'staffview_synth_vol';
@@ -422,12 +437,13 @@ function _svNdReport(hit, midi, bindingId) {
     const nd = window.feedBack && window.feedBack.noteDetection;
     if (!nd || nd.version !== 1) return;
     try {
-        (hit ? nd.reportHit : nd.reportMiss)({
+        const payload = {
             bindingId: bindingId || null,
             providerId: ND_PROVIDER_ID,
             midi,
             hit,
-        });
+        };
+        if (hit) nd.reportHit(payload); else nd.reportMiss(payload);
     } catch (_) {}
 }
 
@@ -479,6 +495,7 @@ let _svAudioCtx        = null;
 let _svSynthGain       = null;
 let _svSynthPlayer     = null;
 let _svSynthPreset     = null;
+let _svSynthInitPromise = null;   // in-flight _svSynthInit() promise (race guard)
 let _svWafScriptLoaded = false;
 const _svNoteEnvelopes = new Map();   // midi → WebAudioFont envelope handle
 let _svSynthVolume        = parseFloat(_svReadStore(_SV_STORE_SYNTH_VOL) || '0.7');
@@ -489,23 +506,35 @@ let _svSynthInstrumentIdx = parseInt(_svReadStore(_SV_STORE_SYNTH_INST) || '0', 
 // repeatedly (no-op once _svSynthPlayer exists) — called from the first
 // note-on so there's no unprompted AudioContext creation (autoplay policy)
 // and no upfront cost for keyboards that are never played.
-async function _svSynthInit() {
-    if (_svSynthPlayer) return;
-    try {
-        if (!_svWafScriptLoaded) {
-            await _svLoadWafScript(WAF_PLAYER_URL);
-            _svWafScriptLoaded = true;
+function _svSynthInit() {
+    if (_svSynthPlayer) return Promise.resolve();
+    // Memoize the in-flight promise so a chord (N near-simultaneous note-ons,
+    // each fire-and-forget calling _svSynthInit) runs the body ONCE instead of
+    // racing N AudioContexts past the null-player guard and orphaning all but
+    // the last (browsers cap ~6 live contexts).
+    if (_svSynthInitPromise) return _svSynthInitPromise;
+    _svSynthInitPromise = (async () => {
+        try {
+            if (!_svWafScriptLoaded) {
+                await _svLoadWafScript(WAF_PLAYER_URL);
+                _svWafScriptLoaded = true;
+            }
+            if (typeof WebAudioFontPlayer === 'undefined') return;
+            _svAudioCtx  = new (window.AudioContext || window.webkitAudioContext)();
+            _svSynthGain = _svAudioCtx.createGain();
+            _svSynthGain.gain.value = _svSynthVolume;
+            _svSynthGain.connect(_svAudioCtx.destination);
+            _svSynthPlayer = new WebAudioFontPlayer();
+            await _svSynthLoadInstrument(_svSynthInstrumentIdx);
+        } catch (e) {
+            console.warn('[staffview] Synth init failed:', e);
+        } finally {
+            // If the player never came up, clear the memo so a later note-on
+            // retries instead of latching onto a dead promise forever.
+            if (!_svSynthPlayer) _svSynthInitPromise = null;
         }
-        if (typeof WebAudioFontPlayer === 'undefined') return;
-        _svAudioCtx  = new (window.AudioContext || window.webkitAudioContext)();
-        _svSynthGain = _svAudioCtx.createGain();
-        _svSynthGain.gain.value = _svSynthVolume;
-        _svSynthGain.connect(_svAudioCtx.destination);
-        _svSynthPlayer = new WebAudioFontPlayer();
-        await _svSynthLoadInstrument(_svSynthInstrumentIdx);
-    } catch (e) {
-        console.warn('[staffview] Synth init failed:', e);
-    }
+    })();
+    return _svSynthInitPromise;
 }
 
 async function _svSynthLoadInstrument(idx) {
@@ -531,7 +560,16 @@ function _svSynthEnsureCtx() {
     if (_svAudioCtx && _svAudioCtx.state === 'suspended') _svAudioCtx.resume();
 }
 
-function _svSynthNoteOn(midi) {
+// Maps a MIDI velocity (0–127) to a WebAudioFont per-note gain (0–1);
+// undefined velocity → full (1). Master volume is applied once by _svSynthGain,
+// so the per-note value must be velocity — NOT _svSynthVolume, which would
+// square the loudness (vol²) and drop dynamics entirely.
+function _svVelocityGain(velocity) {
+    if (velocity == null) return 1;
+    return Math.max(0, Math.min(1, velocity / 127));
+}
+
+function _svSynthNoteOn(midi, velocity) {
     if (!_svSynthPlayer || !_svSynthPreset || !_svAudioCtx || !_svSynthGain) return;
     _svSynthEnsureCtx();
     const existing = _svNoteEnvelopes.get(midi);
@@ -540,7 +578,7 @@ function _svSynthNoteOn(midi) {
         // Duration 999s (effectively "until noteOff") — sustain is driven
         // by explicit cancel(), not the WebAudioFont library's own envelope.
         const envelope = _svSynthPlayer.queueWaveTable(
-            _svAudioCtx, _svSynthGain, _svSynthPreset, 0, midi, 999, _svSynthVolume
+            _svAudioCtx, _svSynthGain, _svSynthPreset, 0, midi, 999, _svVelocityGain(velocity)
         );
         _svNoteEnvelopes.set(midi, envelope);
     } catch (_) {}
@@ -615,6 +653,50 @@ function _svParseMidiMessage(data, savedCh) {
     if (cmd === 0x80 || (cmd === 0x90 && velocity === 0)) return { type: 'noteOff', note };
     if (cmd === 0xB0 && note === 64) return { type: 'sustain', down: velocity >= 64 };
     return null;
+}
+
+// Normalizes the two possible loop-notification payload shapes into
+// { startTime, endTime } (or null if neither is present).
+//   loop:restart        → detail = { loopA, loopB, time }
+//   playback:loop-set   → detail = { payload: { loop: { startTime, endTime, ... } }, ... }
+function _svParseLoopEventDetail(detail) {
+    const d = detail || {};
+    if (d.payload && d.payload.loop
+        && typeof d.payload.loop.startTime === 'number'
+        && typeof d.payload.loop.endTime === 'number') {
+        return { startTime: d.payload.loop.startTime, endTime: d.payload.loop.endTime };
+    }
+    if (typeof d.loopA === 'number' && typeof d.loopB === 'number') {
+        return { startTime: d.loopA, endTime: d.loopB };
+    }
+    return null;
+}
+
+// Returns [earlier, later] sorted by absoluteDisplayStart (or
+// absolutePlaybackStart) tick — used to normalize a drag gesture's
+// start/end beats regardless of which direction the user dragged.
+function _svOrderBeats(beatA, beatB) {
+    const tA = typeof beatA.absoluteDisplayStart === 'number' ? beatA.absoluteDisplayStart
+        : (typeof beatA.absolutePlaybackStart === 'number' ? beatA.absolutePlaybackStart : 0);
+    const tB = typeof beatB.absoluteDisplayStart === 'number' ? beatB.absoluteDisplayStart
+        : (typeof beatB.absolutePlaybackStart === 'number' ? beatB.absolutePlaybackStart : 0);
+    return tA <= tB ? [beatA, beatB] : [beatB, beatA];
+}
+
+// A drag delta past its dead zone arms a loop only when it is horizontally
+// dominant (a scrub across beats), not vertical (an imprecise click or a
+// scroll). Shared by the mouse and touch drag paths so both gate identically.
+// Diagonal (|dx| === |dy|) counts as horizontal, matching the touch path's
+// original `abs(dy) > abs(dx)` disarm test.
+function _svIsHorizontalDrag(dx, dy) {
+    return Math.abs(dx) >= Math.abs(dy);
+}
+
+// A loop whose start and end resolve to the same (or inverted) time is a
+// degenerate zero-length loop — never commit it; the caller treats it as a
+// no-op. Also rejects unresolved (non-number) times.
+function _svIsValidLoopSpan(timeA, timeB) {
+    return typeof timeA === 'number' && typeof timeB === 'number' && timeB > timeA;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -794,6 +876,48 @@ function _clefValue(clefStr) {
 // The internal Automation class is not exported; a plain object works.
 function _makeTempoAutomation(bpm) {
     return { type: 0, isLinear: false, ratioPosition: 0, value: bpm, isVisible: true, text: '' };
+}
+
+// Returns an 'En / Sol' pitch label for a single alphaTab note, e.g.
+// 'C#4 / DO#4'. Respects note.accidentalMode (Force* values override
+// key-signature spelling); falls back to key-signature-derived sharp/flat
+// when accidentalMode is Default(0) or ForceNone(1): positive key
+// signature = sharp keys, negative = flat keys.
+// AccidentalMode enum (verified from AT 1.8.2 source): Default=0
+// ForceNone=1 ForceNatural=2 ForceSharp=3 ForceDoubleSharp=4 ForceFlat=5
+// ForceDoubleFlat=6.
+function _svPitchLabel(note) {
+    const tone   = note.tone;                        // 0-11
+    const octave = note.octave;
+    const am     = (note.accidentalMode != null) ? note.accidentalMode : 0;
+    let ks = 0;
+    try { ks = note.beat.voice.bar.masterBar.keySignature || 0; } catch (_) {}
+
+    let en, sol;
+    if (am === 3) {                                  // ForceSharp
+        en = _SV_NOTE_EN_S[tone]; sol = _SV_NOTE_SOL_S[tone];
+    } else if (am === 5) {                           // ForceFlat
+        en = _SV_NOTE_EN_F[tone]; sol = _SV_NOTE_SOL_F[tone];
+    } else if (am === 4) {                           // ForceDoubleSharp
+        const dsEn  = [null,'B##','C##',null,'D##',null,'E##','F##',null,'G##',null,'A##'];
+        const dsSol = [null,'SI##','DO##',null,'RE##',null,'MI##','FA##',null,'SOL##',null,'LA##'];
+        en  = dsEn[tone]  || _SV_NOTE_EN_S[tone]  + '(##)';
+        sol = dsSol[tone] || _SV_NOTE_SOL_S[tone] + '(##)';
+    } else if (am === 6) {                           // ForceDoubleFlat
+        const dfEn  = ['Dbb',null,'Ebb','Fbb',null,'Gbb',null,'Abb',null,'Bbb','Cbb',null];
+        const dfSol = ['REbb',null,'MIbb','FAbb',null,'SOLbb',null,'LAbb',null,'SIbb','DObb',null];
+        en  = dfEn[tone]  || _SV_NOTE_EN_F[tone]  + '(bb)';
+        sol = dfSol[tone] || _SV_NOTE_SOL_F[tone] + '(bb)';
+    } else if (am === 2) {                           // ForceNatural
+        en = _SV_NOTE_EN_S[tone] + '♮'; sol = _SV_NOTE_SOL_S[tone] + '♮';
+    } else {                                         // Default(0) / ForceNone(1)
+        en  = ks < 0 ? _SV_NOTE_EN_F[tone]  : _SV_NOTE_EN_S[tone];
+        sol = ks < 0 ? _SV_NOTE_SOL_F[tone] : _SV_NOTE_SOL_S[tone];
+    }
+    // note.octave is alphaTab's internal floor(midi/12); scientific-pitch
+    // notation puts middle C (MIDI 60) at C4, so the printed octave is -1.
+    const sci = octave - 1;
+    return en + sci + ' / ' + sol + sci;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1109,6 +1233,12 @@ function createFactory() {
     // the combined denominator too. (They never touch the per-hand tallies.)
     const _svWrongKeyMissTimes = [];
     const _svHitNoteKeys = new Set();   // deduplicates per-note hit claims
+    // scoreLoaded usually fires before the bundle.beats stream arrives, so
+    // the initial judge times come from _svBeatToSeconds's crude constant-BPM
+    // fallback (no lead-in). Rebuild them once real beats show up so judge
+    // times share _handleNoteOn's real-beats timebase. Guarded to rebuild at
+    // most once per song; reset in scoreLoaded.
+    let _svJudgeRebuiltFromBeats = false;
 
     // ── LH/RH hand isolation ─────────────────────────────────────────
     let _svActiveHands = 'both';   // 'both' | 'rh' | 'lh'
@@ -1135,12 +1265,60 @@ function createFactory() {
                                // open-binding response from a rapid song
                                // switch landing after the next chart is
                                // already active
+    // ── Note explorer (alt-click / double-tap pitch tooltip) ────────
+    // _svNoteExplorerEnabled: pill checkbox, persisted, default on.
+    // _svTooltip: reused div, created lazily on first show.
+    // _svTooltipTimer/_svTooltipDismiss: auto-dismiss after 4s or on the
+    // next mousedown anywhere (capture-phase, one-shot).
+    let _svNoteExplorerEnabled = _svReadStore(_SV_STORE_NOTE_EXPLORER) !== 'false';
+    let _svTooltip        = null;
+    let _svTooltipTimer   = null;
+    let _svTooltipDismiss = null;
+
+    // ── Double-tap state (mobile note explorer — alt+click has no touch
+    // equivalent) ────────────────────────────────────────────────────
+    let _svLastTapTime  = 0;   // ms timestamp of the previous touchend
+    let _svLastTapX     = 0;   // canvas-space x of the previous tap
+    let _svLastTapY     = 0;   // canvas-space y of the previous tap
+
+    // ── OGG loop (drag-select region + overlay) ─────────────────────
+    // _svOwnsOggLoop: true only while WE hold the platform loop (set via our
+    // own drag) — teardown/song-switch only clears a loop we set ourselves,
+    // never one the user set through the platform's own native A/B controls.
+    // _svLoopGen: bumped on every _svClearLoop() call; _svApplyOggLoop's
+    // async continuation bails if the generation moved on while it awaited
+    // the platform's setLoop() response (e.g. user cleared or re-dragged
+    // mid-request).
+    // _svLoopStartBeat/_svLoopEndBeat: the committed loop's AT Beat objects
+    // (not raw seconds) so the overlay repositions correctly across
+    // layout/zoom changes via the same boundsLookup-driven path as the
+    // playback marker.
+    let _svOwnsOggLoop   = false;
+    let _svLoopGen       = 0;
+    let _svLoopStartBeat = null;
+    let _svLoopEndBeat   = null;
+    let _svLoopMarkerA   = null;   // green bar — loop start
+    let _svLoopMarkerB   = null;   // green bar — loop end
+    let _svLoopRegionWrap = null;  // container for the region-rect divs
+    let _svLoopClearedHandler = null; // platform 'playback:loop-cleared' listener
+    let _svLoopSetHandler     = null; // platform 'playback:loop-set'/'loop:restart' listener
+
+    // Drag-select gesture state, shared between the mouse (mousedown on
+    // document mousemove/mouseup) and touch (touchstart/touchmove/touchend)
+    // paths so both funnel into the same _svApplyOggLoop() call.
+    let _svDragArmed        = false;
+    let _svDragActive       = false;   // 14px (mouse: 8px) threshold crossed
+    let _svDragStartClientX = 0;
+    let _svDragStartClientY = 0;
+    let _svDragBeat         = null;
+    let _svDragCleanup      = null;    // fn to remove the dynamic mousemove/mouseup pair
 
     // ── Layout mode and zoom (persisted, read once at factory creation) ────
     // Stored as plain values so instance creation doesn't touch alphaTab
     // (not loaded yet) — applied to the AlphaTabApi settings in _svInitAlphaTab.
     let _svLayoutIsHoriz = _svReadStore(_SV_STORE_LAYOUT) === 'horizontal';
-    let _svScale         = parseFloat(_svReadStore(_SV_STORE_SCALE) || '1.0');
+    let _svScaleStored   = parseFloat(_svReadStore(_SV_STORE_SCALE));
+    let _svScale         = _svClampScale(Number.isFinite(_svScaleStored) ? _svScaleStored : 1.0);
     let _svLayoutPageBtn  = null;
     let _svLayoutHorizBtn = null;
     let _svZoomLabel      = null;
@@ -1220,6 +1398,16 @@ function createFactory() {
         // rendering and skips entirely when it reads 0 — explicit width
         // keeps horizontal-layout loads from rendering blank.
         inner.style.width = '100%';
+        // Disables the browser's native double-tap zoom so the touchend
+        // handler below can use double-tap for the note explorer.
+        inner.style.touchAction = 'manipulation';
+        // Prevents iOS's text-selection magnifier from firing when a finger
+        // drags across the notation surface (SVG — nothing meaningful to
+        // select). Belt-and-suspenders: the touchmove drag handler below
+        // also calls preventDefault() once a horizontal drag is confirmed.
+        inner.style.userSelect       = 'none';
+        inner.style.webkitUserSelect = 'none';
+        inner.addEventListener('selectstart', (e) => e.preventDefault());
         c.appendChild(inner);
 
         // Playback marker — boundsLookup-driven (slopsmith#734 pattern).
@@ -1253,13 +1441,50 @@ function createFactory() {
         _svAtMount    = inner;
         _svMarker     = marker;
         _svMissCanvas = missCanvas;
+        // Loop overlay: green A/B marker bars + a region-rect wrapper,
+        // initially hidden (Group B1-a).
+        function _mkLoopMarker(label) {
+            const m = document.createElement('div');
+            m.style.cssText = [
+                'position:absolute', 'top:0', 'left:0', 'width:2px', 'height:0',
+                'background:#22c55e', 'pointer-events:none', 'z-index:998', 'display:none',
+            ].join(';');
+            const badge = document.createElement('span');
+            badge.textContent = label;
+            badge.style.cssText = [
+                'position:absolute', 'top:0', 'left:3px',
+                'font-size:10px', 'color:#22c55e', 'font-family:monospace',
+                'font-weight:bold', 'line-height:1', 'pointer-events:none',
+            ].join(';');
+            m.appendChild(badge);
+            return m;
+        }
+        const loopMarkerA    = _mkLoopMarker('A');
+        const loopMarkerB    = _mkLoopMarker('B');
+        const loopRegionWrap = document.createElement('div');
+        loopRegionWrap.style.cssText =
+            'position:absolute;top:0;left:0;pointer-events:none;z-index:997;overflow:visible;';
+        c.appendChild(loopMarkerA);
+        c.appendChild(loopMarkerB);
+        c.appendChild(loopRegionWrap);
 
-        // ── Click-to-seek ─────────────────────────────────────────
-        // mousedown on the score div: resolve the clicked position to a
-        // beat tick via boundsLookup.getBeatAtPos(), then seek the OGG
-        // audio element (currentTime) via the bundle.beats time stream.
+        mount.appendChild(c);
+        _svContainer      = c;
+        _svAtMount        = inner;
+        _svMarker         = marker;
+        _svLoopMarkerA    = loopMarkerA;
+        _svLoopMarkerB    = loopMarkerB;
+        _svLoopRegionWrap = loopRegionWrap;
+
+        // ── Interaction model ────────────────────────────────────────
+        //   Alt+click        → note explorer pitch tooltip
+        //   Drag (> 8px)      → set loop region (drag-select)
+        //   Short click       → seek cursor
+        // mousedown arms drag state; dynamic mousemove/mouseup listeners on
+        // document decide the outcome once the gesture completes (mirrors
+        // the pill's own bounded-retry style of deferred decision-making).
         inner.addEventListener('mousedown', (e) => {
-            if (!_svApi || !_svApiReady) return;
+            if (e.button !== 0 || !_svApi || !_svApiReady) return;
             const bl = _svApi.boundsLookup;
             if (!bl || typeof bl.getBeatAtPos !== 'function') return;
 
@@ -1273,24 +1498,218 @@ function createFactory() {
             try { beat = bl.getBeatAtPos(x, y); } catch (_) { return; }
             if (!beat) return;
 
-            const tick = typeof beat.absoluteDisplayStart === 'number'
-                ? beat.absoluteDisplayStart
-                : (typeof beat.absolutePlaybackStart === 'number'
-                    ? beat.absolutePlaybackStart : null);
-            if (tick === null) return;
+            // Alt+click → note explorer tooltip; suppresses seek/drag for
+            // this click (no-op, falls through to nothing, if the beat is
+            // a rest).
+            if (e.altKey && _svNoteExplorerEnabled) {
+                if (beat.notes && beat.notes.length > 0) {
+                    _svShowNoteTooltip(beat, x, y);
+                }
+                return;
+            }
 
-            // Update our cursor immediately.
-            _svLastTick = tick;
-            _svLastBeat = beat;
-            _svUpdateMarker();
+            // Cancel any stale drag listeners from a previous gesture.
+            if (_svDragCleanup) { _svDragCleanup(); _svDragCleanup = null; }
 
-            // Seek the OGG audio element.
-            const secs = _svBeatToSeconds(beat);
-            if (secs !== null) {
-                const audio = document.getElementById('audio');
-                if (audio) { try { audio.currentTime = secs; } catch (_) {} }
+            _svDragArmed        = true;
+            _svDragActive       = false;
+            _svDragStartClientX = e.clientX;
+            _svDragStartClientY = e.clientY;
+            _svDragBeat         = beat;
+
+            const onMove = (ev) => {
+                if (!_svDragArmed) return;
+                if (!_svDragActive) {
+                    const dx = ev.clientX - _svDragStartClientX;
+                    const dy = ev.clientY - _svDragStartClientY;
+                    if (Math.hypot(dx, dy) <= 8) return;
+                    // Horizontal-dominance gate (mirrors the touch path): a
+                    // mostly-vertical move is an imprecise click, not a loop.
+                    // Disarm so onUp seeks; keep _svDragBeat (unlike touch) so
+                    // that seek can still resolve the start beat.
+                    if (!_svIsHorizontalDrag(dx, dy)) { _svDragArmed = false; return; }
+                    _svDragActive = true;
+                }
+                const bll = _svApi && _svApi.boundsLookup;
+                if (!bll || typeof bll.getBeatAtPos !== 'function') return;
+                const rc  = inner.getBoundingClientRect();
+                const cx  = ev.clientX - rc.left + inner.scrollLeft;
+                const cy  = ev.clientY - rc.top  + inner.scrollTop;
+                let endBeat;
+                try { endBeat = bll.getBeatAtPos(cx, cy); } catch (_) { return; }
+                if (endBeat) _svDrawLoopPreview(_svDragBeat, endBeat);
+            };
+
+            const onUp = (ev) => {
+                _svDragCleanup && _svDragCleanup();
+                _svDragCleanup = null;
+
+                const wasActive = _svDragActive;
+                const startBeat = _svDragBeat;
+                _svDragArmed  = false;
+                _svDragActive = false;
+                _svDragBeat   = null;
+                _svClearLoopPreview();
+
+                if (!startBeat || !_svApi || !_svApiReady) return;
+
+                if (wasActive) {
+                    // Drag → set loop.
+                    const bll = _svApi && _svApi.boundsLookup;
+                    if (!bll || typeof bll.getBeatAtPos !== 'function') return;
+                    const rc = inner.getBoundingClientRect();
+                    const ex = ev.clientX - rc.left + inner.scrollLeft;
+                    const ey = ev.clientY - rc.top  + inner.scrollTop;
+                    let endBeat;
+                    try { endBeat = bll.getBeatAtPos(ex, ey); } catch (_) {}
+                    if (!endBeat) endBeat = startBeat;
+                    const [beatA, beatB] = _svOrderBeats(startBeat, endBeat);
+                    _svApplyOggLoop(beatA, beatB);
+                } else {
+                    // Short click → seek.
+                    const beat2 = startBeat;
+                    const tick = typeof beat2.absoluteDisplayStart === 'number'
+                        ? beat2.absoluteDisplayStart
+                        : (typeof beat2.absolutePlaybackStart === 'number'
+                            ? beat2.absolutePlaybackStart : null);
+                    if (tick === null) return;
+                    _svLastTick = tick;
+                    _svLastBeat = beat2;
+                    _svUpdateMarker();
+                    const secs = _svBeatToSeconds(beat2);
+                    if (secs !== null) {
+                        const audio = document.getElementById('audio');
+                        if (audio) { try { audio.currentTime = secs; } catch (_) {} }
+                    }
+                }
+            };
+
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup',   onUp);
+            _svDragCleanup = () => {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup',   onUp);
+            };
+        });
+
+        // Double-tap → note explorer (mobile equivalent of alt+click; touch
+        // devices have no alt key). touch-action:manipulation on inner
+        // (set above) already disables the browser's native double-tap
+        // zoom; preventDefault() here suppresses the synthesized mouse
+        // events that would otherwise follow the second tap.
+        inner.addEventListener('touchend', (e) => {
+            if (!_svNoteExplorerEnabled || !_svApi || !_svApiReady) return;
+            const t = e.changedTouches[0];
+            if (!t) return;
+            const rect = inner.getBoundingClientRect();
+            const x = t.clientX - rect.left + inner.scrollLeft;
+            const y = t.clientY - rect.top  + inner.scrollTop;
+            const now = Date.now();
+            const dt  = now - _svLastTapTime;
+            const dx  = x - _svLastTapX;
+            const dy  = y - _svLastTapY;
+            if (dt < 300 && Math.hypot(dx, dy) < 30) {
+                // Second tap within window — treat as double-tap.
+                e.preventDefault();
+                _svLastTapTime = 0; // reset so a triple-tap doesn't re-trigger
+                const bl = _svApi.boundsLookup;
+                if (!bl || typeof bl.getBeatAtPos !== 'function') return;
+                let beat;
+                try { beat = bl.getBeatAtPos(x, y); } catch (_) { return; }
+                if (beat && beat.notes && beat.notes.length > 0) {
+                    _svShowNoteTooltip(beat, x, y);
+                }
+            } else {
+                _svLastTapTime = now;
+                _svLastTapX    = x;
+                _svLastTapY    = y;
             }
         });
+
+        // Touch drag → loop region (mobile equivalent of the mouse drag
+        // above). touchstart arms the drag using the same shared state vars
+        // as the mousedown path. The dead zone is wider than the mouse path
+        // (14px vs 8px) to absorb natural finger tremor, and a
+        // predominantly-vertical first movement disarms the drag and yields
+        // to native container scroll instead of hijacking it —
+        // preventDefault() only fires once a horizontal drag is confirmed.
+        // touchend with an active drag calls preventDefault() to suppress
+        // the synthetic mousedown/click the browser would otherwise
+        // generate, so the loop gesture isn't immediately followed by an
+        // accidental seek. Single taps fall through to the existing
+        // synthesized mousedown handler unchanged.
+        inner.addEventListener('touchstart', (e) => {
+            if (!_svApi || !_svApiReady) return;
+            const t = e.touches[0];
+            if (!t) return;
+            const bl = _svApi.boundsLookup;
+            if (!bl || typeof bl.getBeatAtPos !== 'function') return;
+            const rect = inner.getBoundingClientRect();
+            const x = t.clientX - rect.left + inner.scrollLeft;
+            const y = t.clientY - rect.top  + inner.scrollTop;
+            let beat;
+            try { beat = bl.getBeatAtPos(x, y); } catch (_) { return; }
+            if (!beat) return;
+            if (_svDragCleanup) { _svDragCleanup(); _svDragCleanup = null; }
+            _svDragArmed        = true;
+            _svDragActive       = false;
+            _svDragStartClientX = t.clientX;
+            _svDragStartClientY = t.clientY;
+            _svDragBeat         = beat;
+        }, { passive: true });
+
+        inner.addEventListener('touchmove', (e) => {
+            if (!_svDragArmed) return;
+            const t = e.touches[0];
+            if (!t) return;
+            if (!_svDragActive) {
+                const dx = t.clientX - _svDragStartClientX;
+                const dy = t.clientY - _svDragStartClientY;
+                if (Math.hypot(dx, dy) <= 14) return;
+                // Vertical intent → disarm and yield to native scroll.
+                if (!_svIsHorizontalDrag(dx, dy)) {
+                    _svDragArmed = false;
+                    _svDragBeat  = null;
+                    return;
+                }
+                _svDragActive = true;
+            }
+            e.preventDefault(); // stop iOS scroll and selection once horizontal drag is confirmed
+            const bll = _svApi && _svApi.boundsLookup;
+            if (!bll || typeof bll.getBeatAtPos !== 'function') return;
+            const rc = inner.getBoundingClientRect();
+            const cx = t.clientX - rc.left + inner.scrollLeft;
+            const cy = t.clientY - rc.top  + inner.scrollTop;
+            let endBeat;
+            try { endBeat = bll.getBeatAtPos(cx, cy); } catch (_) { return; }
+            if (endBeat) _svDrawLoopPreview(_svDragBeat, endBeat);
+        }, { passive: false });
+
+        inner.addEventListener('touchend', (e) => {
+            if (!_svDragArmed) return;
+            const wasActive = _svDragActive;
+            const startBeat = _svDragBeat;
+            _svDragArmed  = false;
+            _svDragActive = false;
+            _svDragBeat   = null;
+            _svClearLoopPreview();
+            if (!wasActive || !startBeat || !_svApi || !_svApiReady) return;
+            // Suppress synthetic mousedown/click so the drag isn't followed
+            // by an accidental seek.
+            e.preventDefault();
+            const t = e.changedTouches[0];
+            if (!t) return;
+            const bll = _svApi && _svApi.boundsLookup;
+            if (!bll || typeof bll.getBeatAtPos !== 'function') return;
+            const rc = inner.getBoundingClientRect();
+            const ex = t.clientX - rc.left + inner.scrollLeft;
+            const ey = t.clientY - rc.top  + inner.scrollTop;
+            let endBeat;
+            try { endBeat = bll.getBeatAtPos(ex, ey); } catch (_) {}
+            if (!endBeat) endBeat = startBeat;
+            const [beatA, beatB] = _svOrderBeats(startBeat, endBeat);
+            _svApplyOggLoop(beatA, beatB);
+        }, { passive: false });
 
         // ResizeObserver on controls bar so bottom inset stays correct
         // when the bar wraps to a second row (main-player only).
@@ -1352,7 +1771,317 @@ function createFactory() {
             _svAtMount    = null;
             _svMarker     = null;
             _svMissCanvas = null;
+            _svLoopMarkerA    = null;
+            _svLoopMarkerB    = null;
+            _svLoopRegionWrap = null;
         }
+    }
+
+    // ── Note explorer tooltip ────────────────────────────────────────
+
+    function _svTooltipDismissAll() {
+        if (_svTooltipTimer) { clearTimeout(_svTooltipTimer); _svTooltipTimer = null; }
+        if (_svTooltipDismiss) {
+            document.removeEventListener('mousedown', _svTooltipDismiss, { capture: true });
+            _svTooltipDismiss = null;
+        }
+        if (_svTooltip) { _svTooltip.style.display = 'none'; }
+    }
+
+    // Shows a floating pitch label near the click/tap position, clamped to
+    // the visible (scrolled) area of _svContainer. One line per note in the
+    // beat (chord support). Dismissed on the next mousedown anywhere or
+    // after 4s.
+    function _svShowNoteTooltip(beat, clickX, clickY) {
+        const lines = beat.notes.map(_svPitchLabel);
+        if (!lines.length) return;
+
+        if (!_svTooltip) {
+            const t = document.createElement('div');
+            t.className = 'sv-note-tooltip';
+            t.style.cssText = [
+                'position:absolute',
+                'padding:5px 10px',
+                'border-radius:8px',
+                'background:rgba(12,12,22,0.96)',
+                'border:1px solid rgba(255,255,255,0.12)',
+                'color:#e2e8f0',
+                'font-family:monospace',
+                'font-size:13px',
+                'line-height:1.6',
+                'white-space:pre',
+                'pointer-events:none',
+                'z-index:10',
+                'box-shadow:0 4px 12px rgba(0,0,0,0.4)',
+            ].join(';');
+            _svContainer.appendChild(t);
+            _svTooltip = t;
+        }
+
+        // Dismiss any previous tooltip/timer BEFORE showing the new one —
+        // doing this after `style.display = ''` would immediately hide the
+        // tooltip we just showed.
+        _svTooltipDismissAll();
+
+        _svTooltip.textContent = lines.join('\n');
+        _svTooltip.style.display = '';
+
+        // Position near the click, offset into container coordinates, then
+        // clamp to the currently-visible viewport of the scrollable container.
+        const tw  = _svTooltip.offsetWidth  || 120;
+        const th  = _svTooltip.offsetHeight || 40;
+        const cw  = _svContainer.clientWidth;
+        const ch  = _svContainer.clientHeight;
+        const sl  = _svContainer.scrollLeft;
+        const st  = _svContainer.scrollTop;
+        const ox  = (_svAtMount ? _svAtMount.offsetLeft : 0);
+        const oy  = (_svAtMount ? _svAtMount.offsetTop  : 0);
+        const GAP = 8;
+        let left = ox + clickX + GAP;
+        let top  = oy + clickY - Math.round(th / 2);
+        if (left + tw  > sl + cw - GAP) left = sl + cw - tw - GAP;
+        if (left       < sl + GAP)      left = sl + GAP;
+        if (top  + th  > st + ch - GAP) top  = st + ch - th - GAP;
+        if (top        < st + GAP)      top  = st + GAP;
+        _svTooltip.style.left = Math.round(left) + 'px';
+        _svTooltip.style.top  = Math.round(top)  + 'px';
+
+        _svTooltipTimer   = setTimeout(_svTooltipDismissAll, 4000);
+        _svTooltipDismiss = () => _svTooltipDismissAll();
+        document.addEventListener('mousedown', _svTooltipDismiss, { capture: true, once: true });
+    }
+
+    // ── OGG loop helpers ─────────────────────────────────────────────
+
+    // Inverse of _svBeatToSeconds. bundle.beats[i] is the time at tick i*960
+    // (one entry per quarter-note beat, same assumption _svBeatToSeconds
+    // uses). Binary-search _svLatestBeats for the time, interpolate a
+    // fractional beat index, convert to tick = (idx+frac)*960, then look up
+    // the AT Beat via _svFindBeatAtTick. Used to mirror a loop set through
+    // the platform's own native controls (seconds) into our AT-Beat-based
+    // overlay.
+    function _svTimeToNearestBeat(time) {
+        const lb = _svLatestBeats;
+        if (!lb || lb.length < 2) return null;
+        if (time <= lb[0].time) return _svFindBeatAtTick(0);
+        let lo = 0, hi = lb.length - 1, idx = 0;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (lb[mid].time <= time) { idx = mid; lo = mid + 1; }
+            else { hi = mid - 1; }
+        }
+        let frac = 0;
+        if (idx < lb.length - 1) {
+            const t0 = lb[idx].time, t1 = lb[idx + 1].time;
+            if (t1 > t0) frac = Math.min(1, (time - t0) / (t1 - t0));
+        }
+        return _svFindBeatAtTick(Math.round((idx + frac) * 960));
+    }
+
+    // Creates a single region-rect element (absolutely positioned in
+    // _svContainer space).
+    function _svMakeRegionRect(left, top, width, height) {
+        const d = document.createElement('div');
+        d.style.cssText = [
+            'position:absolute',
+            'background:rgba(34,197,94,0.12)',
+            'border-top:1px solid rgba(34,197,94,0.3)',
+            'border-bottom:1px solid rgba(34,197,94,0.3)',
+            'pointer-events:none',
+            'left:' + left + 'px',
+            'top:'  + top  + 'px',
+            'width:'  + width  + 'px',
+            'height:' + height + 'px',
+        ].join(';');
+        return d;
+    }
+
+    // Positions a single loop marker (A or B) at the given beat.
+    function _svPositionLoopMarker(marker, beat, side) {
+        if (!marker || !_svAtMount) return false;
+        const bl = _svApi && _svApi.boundsLookup;
+        if (!bl || typeof bl.findBeat !== 'function') return false;
+        const bb = bl.findBeat(beat);
+        if (!bb || !bb.visualBounds) return false;
+        const vb = bb.visualBounds;
+        let sysTop = vb.y, sysH = vb.h;
+        try {
+            const systems = bl.staffSystems || [];
+            for (const sys of systems) {
+                const svb = sys && sys.visualBounds;
+                if (!svb) continue;
+                if (vb.y >= svb.y && vb.y < svb.y + svb.h) {
+                    sysTop = svb.y; sysH = svb.h; break;
+                }
+            }
+        } catch (_) {}
+        const baseX = _svAtMount.offsetLeft;
+        const baseY = _svAtMount.offsetTop;
+        const left  = Math.round(baseX + (side === 'B' ? vb.x + vb.w : vb.x));
+        marker.style.left    = left + 'px';
+        marker.style.top     = Math.round(baseY + sysTop) + 'px';
+        marker.style.height  = Math.round(sysH) + 'px';
+        marker.style.display = '';
+        return true;
+    }
+
+    // Positions both loop markers and fills the region rects for
+    // beatA → beatB, spanning multiple staff-system rows when the loop
+    // crosses a line break.
+    function _svUpdateLoopOverlay(beatA, beatB) {
+        if (!_svLoopMarkerA || !_svLoopMarkerB || !_svLoopRegionWrap || !_svAtMount) return;
+        if (!beatA && !beatB) { _svHideLoopOverlay(); return; }
+
+        // Partial state (drag in progress with only a start beat yet, or
+        // A/B set independently by the platform's own controls before the
+        // pair is complete) — show just the one marker.
+        if (!beatA || !beatB) {
+            _svHideLoopOverlay();
+            if (beatA) _svPositionLoopMarker(_svLoopMarkerA, beatA, 'A');
+            else       _svPositionLoopMarker(_svLoopMarkerB, beatB, 'B');
+            return;
+        }
+
+        const bl = _svApi && _svApi.boundsLookup;
+        if (!bl || typeof bl.findBeat !== 'function') { _svHideLoopOverlay(); return; }
+
+        const bbA = bl.findBeat(beatA);
+        const bbB = bl.findBeat(beatB);
+        if (!bbA || !bbA.visualBounds || !bbB || !bbB.visualBounds) {
+            _svHideLoopOverlay(); return;
+        }
+
+        const vbA   = bbA.visualBounds;
+        const vbB   = bbB.visualBounds;
+        const baseX = _svAtMount.offsetLeft;
+        const baseY = _svAtMount.offsetTop;
+
+        // Collect sorted staffSystem rows.
+        const rows = [];
+        try {
+            const systems = bl.staffSystems || [];
+            for (const sys of systems) {
+                if (sys && sys.visualBounds) rows.push(sys.visualBounds);
+            }
+            rows.sort((a, b) => a.y - b.y);
+        } catch (_) {}
+
+        function findRow(vb) {
+            for (const r of rows) {
+                if (vb.y >= r.y && vb.y < r.y + r.h) return r;
+            }
+            return null;
+        }
+
+        const rowA = findRow(vbA);
+        const rowB = findRow(vbB);
+
+        _svPositionLoopMarker(_svLoopMarkerA, beatA, 'A');
+        _svPositionLoopMarker(_svLoopMarkerB, beatB, 'B');
+
+        _svLoopRegionWrap.innerHTML = '';
+
+        if (!rowA || !rowB || rowA === rowB || Math.abs(rowA.y - rowB.y) < 1) {
+            // Same system row.
+            const left   = Math.round(baseX + Math.min(vbA.x, vbB.x));
+            const right  = Math.round(baseX + Math.max(vbA.x + vbA.w, vbB.x + vbB.w));
+            const top    = Math.round(baseY + (rowA ? rowA.y : Math.min(vbA.y, vbB.y)));
+            const height = Math.round(rowA ? rowA.h : Math.max(vbA.h, vbB.h));
+            if (right > left) {
+                _svLoopRegionWrap.appendChild(_svMakeRegionRect(left, top, right - left, height));
+            }
+        } else {
+            // Multi-row: span from rowA.y to rowB.y inclusive, one region
+            // rect per row, clipped to the loop's start/end column on the
+            // first/last row respectively.
+            const spanned = rows.filter(r => r.y >= rowA.y && r.y <= rowB.y);
+            for (const row of spanned) {
+                let left, right;
+                if (Math.abs(row.y - rowA.y) < 1) {
+                    left  = Math.round(baseX + vbA.x);
+                    right = Math.round(baseX + row.x + row.w);
+                } else if (Math.abs(row.y - rowB.y) < 1) {
+                    left  = Math.round(baseX + row.x);
+                    right = Math.round(baseX + vbB.x + vbB.w);
+                } else {
+                    left  = Math.round(baseX + row.x);
+                    right = Math.round(baseX + row.x + row.w);
+                }
+                const top    = Math.round(baseY + row.y);
+                const height = Math.round(row.h);
+                if (right > left) {
+                    _svLoopRegionWrap.appendChild(
+                        _svMakeRegionRect(left, top, right - left, height));
+                }
+            }
+        }
+    }
+
+    function _svHideLoopOverlay() {
+        if (_svLoopMarkerA)    _svLoopMarkerA.style.display = 'none';
+        if (_svLoopMarkerB)    _svLoopMarkerB.style.display = 'none';
+        if (_svLoopRegionWrap) _svLoopRegionWrap.innerHTML  = '';
+    }
+
+    function _svDrawLoopPreview(startBeat, endBeat) {
+        if (!startBeat || !endBeat) return;
+        const [beatA, beatB] = _svOrderBeats(startBeat, endBeat);
+        _svUpdateLoopOverlay(beatA, beatB);
+    }
+
+    // After a drag ends without committing (or is cancelled): restore
+    // whatever loop state was already committed, or hide if none.
+    function _svClearLoopPreview() {
+        _svUpdateLoopOverlay(_svLoopStartBeat, _svLoopEndBeat);
+    }
+
+    // Applies a loop via the platform's native setLoop() API. Shows the
+    // overlay immediately (optimistic); rolls back to the previously
+    // committed state if the platform rejects the request.
+    async function _svApplyOggLoop(beatA, beatB) {
+        const timeA = _svBeatToSeconds(beatA);
+        const timeB = _svBeatToSeconds(beatB);
+        // Reject unresolved times and degenerate zero-length loops (drag
+        // start and end on the same beat) — treat as a no-op, not a loop.
+        if (!_svIsValidLoopSpan(timeA, timeB)) return;
+
+        // Capture the generation so a concurrent _svClearLoop (or a second,
+        // faster drag) can invalidate this continuation.
+        const gen = ++_svLoopGen;
+
+        _svUpdateLoopOverlay(beatA, beatB);
+
+        let result;
+        try { result = await window.feedBack.setLoop(timeA, timeB); }
+        catch (_) { result = false; }
+
+        if (gen !== _svLoopGen) return;
+
+        if (result === false) {
+            _svUpdateLoopOverlay(_svLoopStartBeat, _svLoopEndBeat);
+            return;
+        }
+
+        _svOwnsOggLoop   = true;
+        _svLoopStartBeat = beatA;
+        _svLoopEndBeat   = beatB;
+        _svUpdateLoopOverlay(beatA, beatB);
+    }
+
+    // Clears a loop WE set. Never clears a loop the platform's own native
+    // controls set (_svOwnsOggLoop stays false in that case) — teardown/
+    // song-switch should not steal a loop the user set through the
+    // platform's own UI.
+    function _svClearLoop() {
+        _svLoopGen++;   // invalidate any pending _svApplyOggLoop continuation
+
+        if (_svOwnsOggLoop) {
+            try { window.feedBack.clearLoop(); } catch (_) {}
+            _svOwnsOggLoop = false;
+        }
+        _svLoopStartBeat = null;
+        _svLoopEndBeat   = null;
+        _svHideLoopOverlay();
     }
 
     // ── Layout mode and zoom controls ───────────────────────────────
@@ -1682,6 +2411,31 @@ function createFactory() {
         volRow.appendChild(volLabel);
         volRow.appendChild(volRange);
         midiSection.appendChild(volRow);
+        // ── NOTE EXPLORER section ──────────────────────────────────
+        // Single checkbox for now. A future MIDI note-detection PR is
+        // expected to grow this into a full "Note Detection" section
+        // (Detect toggle, Clear-on-rewind) alongside this control.
+        const explorerSection = document.createElement('div');
+
+        const explorerRow = document.createElement('div');
+        explorerRow.className = 'section-practice-controls-row';
+        const explorerWrap = document.createElement('label');
+        explorerWrap.className = 'section-practice-mode-wrap';
+        const explorerCb = document.createElement('input');
+        explorerCb.type    = 'checkbox';
+        explorerCb.id      = 'sv-cb-note-explorer-' + _instanceId;
+        explorerCb.checked = _svNoteExplorerEnabled;
+        explorerCb.addEventListener('change', () => {
+            _svNoteExplorerEnabled = explorerCb.checked;
+            _svSaveStore(_SV_STORE_NOTE_EXPLORER, String(_svNoteExplorerEnabled));
+        });
+        const explorerText = document.createElement('span');
+        explorerText.className = 'section-practice-mode-text';
+        explorerText.textContent = 'Note explorer (alt+click / double-tap)';
+        explorerWrap.appendChild(explorerCb);
+        explorerWrap.appendChild(explorerText);
+        explorerRow.appendChild(explorerWrap);
+        explorerSection.appendChild(explorerRow);
 
         // ── LAYOUT section ────────────────────────────────────────
         const layoutSection = document.createElement('div');
@@ -1825,6 +2579,7 @@ function createFactory() {
         _svUpdateHandButtons();   // reflect current _svActiveHands
 
         popover.appendChild(midiSection);
+        popover.appendChild(explorerSection);
         popover.appendChild(layoutSection);
         popover.appendChild(zoomSection);
         popover.appendChild(handSection);
@@ -2105,6 +2860,7 @@ function createFactory() {
             // no hand colouring, and a single-staff chart has no hands to split.
             _svActiveHands = 'both';
             _svUpdateHandButtons();
+            _svJudgeRebuiltFromBeats = false;
             _svBuildJudgeLists(score);
             // Show the HAND toggles only for grand-staff (≥2 staves) scores.
             if (_svHandRow) {
@@ -2134,7 +2890,8 @@ function createFactory() {
             _svFailedArr  = null;
             _svRemoveErrorBanner();
 
-            // Re-place marker after each layout (boundsLookup is freshly valid).
+            // Re-place marker and loop overlay after each layout (boundsLookup
+            // is freshly valid).
             _svUpdateMarker();
 
             // Re-size and repaint the miss-dot overlay after each relayout.
@@ -2149,6 +2906,7 @@ function createFactory() {
                     _svRedrawAllMissDots();
                 });
             }
+            _svUpdateLoopOverlay(_svLoopStartBeat, _svLoopEndBeat);
         });
 
         // ── alphaTab error ────────────────────────────────────────
@@ -2177,6 +2935,47 @@ function createFactory() {
         if (_svRendered || !_svNotationReady || !_svInfo || _svMeasures.length === 0) return;
         if (_svInitToken !== myToken) return;
         _svRendered = true;
+
+        // Register platform loop listeners for the full session lifetime.
+        // loop-cleared: hide the overlay when the platform clears the loop
+        // (regardless of who set it). loop-set / loop:restart: mirror a
+        // loop set through the platform's own native controls (or a
+        // restored saved loop) onto our score overlay — without this, the
+        // overlay only ever reflects loops WE set via drag.
+        if (window.feedBack && typeof window.feedBack.on === 'function') {
+            if (_svLoopClearedHandler) {
+                window.feedBack.off('playback:loop-cleared', _svLoopClearedHandler);
+            }
+            _svLoopClearedHandler = () => {
+                if (_svInitToken !== myToken) return;
+                _svOwnsOggLoop   = false;
+                _svLoopStartBeat = null;
+                _svLoopEndBeat   = null;
+                _svHideLoopOverlay();
+            };
+            window.feedBack.on('playback:loop-cleared', _svLoopClearedHandler);
+
+            if (_svLoopSetHandler) {
+                window.feedBack.off('playback:loop-set', _svLoopSetHandler);
+                window.feedBack.off('loop:restart',      _svLoopSetHandler);
+            }
+            _svLoopSetHandler = (ev) => {
+                if (_svInitToken !== myToken) return;
+                // window.feedBack events are DOM CustomEvents — data lives
+                // in ev.detail. _svParseLoopEventDetail normalizes the two
+                // possible shapes (see its own doc comment).
+                const loop = _svParseLoopEventDetail(ev && ev.detail);
+                if (!loop) return;
+                const beatA = _svTimeToNearestBeat(loop.startTime);
+                const beatB = _svTimeToNearestBeat(loop.endTime);
+                if (!beatA || !beatB) return;
+                _svLoopStartBeat = beatA;
+                _svLoopEndBeat   = beatB;
+                _svUpdateLoopOverlay(beatA, beatB);
+            };
+            window.feedBack.on('playback:loop-set', _svLoopSetHandler);
+            window.feedBack.on('loop:restart',      _svLoopSetHandler);
+        }
 
         const container = _svCreateContainer();
         if (!container) {
@@ -2449,9 +3248,9 @@ function createFactory() {
 
     // Thin wrappers so _handleNoteOn/_handleNoteOff read as "judge + sound"
     // rather than reaching into the module-level synth directly.
-    function _svMonitorNoteOn(midi) {
+    function _svMonitorNoteOn(midi, velocity) {
         _svSynthInit();   // no-op once already initialised
-        _svSynthNoteOn(midi);
+        _svSynthNoteOn(midi, velocity);
     }
     function _svMonitorNoteOff(midi) { _svSynthNoteOff(midi); }
 
@@ -2876,7 +3675,7 @@ function createFactory() {
     function _handleNoteOn(midi, velocity) {
         if (midi < 0 || midi > 127) return;
         _svHeldNotes.set(midi, velocity);
-        _svMonitorNoteOn(midi);
+        _svMonitorNoteOn(midi, velocity);
         const t = _svGetCurrentTime();
         if (t !== null) {
             const hitKey = _svJudgeHit(midi, t);
@@ -2950,6 +3749,9 @@ function createFactory() {
         // Notation is going away — restore core's HUD to the top bar (no-op if
         // this instance wasn't the one showing notation).
         _svSetNotationShowing(instance, false);
+        _svTooltipDismissAll();
+        _svTooltip     = null;
+        _svLastTapTime = 0;
         _svApiReady      = false;
         _svLastTick      = -1;
         _svLastBeat      = null;
@@ -2972,6 +3774,24 @@ function createFactory() {
         _svMissEntryByKey.clear();
         _svMissSweepIdx  = 0;
         _svLastSweepTime = -1;
+        // Cancel any in-flight drag gesture.
+        if (_svDragCleanup) { _svDragCleanup(); _svDragCleanup = null; }
+        _svDragArmed = false; _svDragActive = false; _svDragBeat = null;
+
+        // Clear a loop WE set and hide the overlay (_svClearLoop() is a
+        // no-op on the platform side if the platform's own controls set the
+        // current loop — _svOwnsOggLoop stays false in that case).
+        _svClearLoop();
+
+        if (window.feedBack && typeof window.feedBack.off === 'function') {
+            if (_svLoopClearedHandler) window.feedBack.off('playback:loop-cleared', _svLoopClearedHandler);
+            if (_svLoopSetHandler) {
+                window.feedBack.off('playback:loop-set', _svLoopSetHandler);
+                window.feedBack.off('loop:restart',      _svLoopSetHandler);
+            }
+        }
+        _svLoopClearedHandler = null;
+        _svLoopSetHandler     = null;
 
         _svCloseWs();
 
@@ -3053,6 +3873,22 @@ function createFactory() {
             if (!_isReady || !bundle) return;
 
             _svLatestBeats = bundle.beats || null;
+
+            // Judge times were built at scoreLoaded from the constant-BPM
+            // fallback (beats hadn't arrived). Rebuild once on the real beats
+            // stream so judge times match _handleNoteOn's timebase.
+            if (!_svJudgeRebuiltFromBeats
+                    && _svLatestBeats && _svLatestBeats.length >= 2
+                    && _svApi && _svApi.score && _svJudgeNotesAll) {
+                _svJudgeRebuiltFromBeats = true;
+                // Rebuild only changes judge times; noteKeys are tick/index-
+                // based and stable. _svBuildJudgeLists clears _svHitNoteKeys,
+                // so preserve already-counted hits to avoid double-scoring
+                // notes hit before the real beats landed.
+                const priorHits = new Set(_svHitNoteKeys);
+                _svBuildJudgeLists(_svApi.score);
+                for (const k of priorHits) _svHitNoteKeys.add(k);
+            }
 
             // Detect song/arrangement change → open a new WS.
             const songInfo = bundle.songInfo || {};
