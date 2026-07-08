@@ -16,6 +16,12 @@
 //   - Options pill (v3 plugin-control slot / v2 #player-footer / splitscreen
 //     panel): LAYOUT (page/horizontal) and ZOOM controls, persisted to
 //     localStorage
+//   - MIDI input via the core midi-input capability domain
+//     (window.feedBack.midiInput), mirroring plugins/keys_highway_3d's
+//     connection pattern. Note-on/off is judged against the loaded score
+//     and reported through the core note-detection domain (register-
+//     provider once, open-binding per chart, reportHit/reportMiss) —
+//     staffview owns judgment, the domain only carries the result.
 //   - Note explorer: alt+click (desktop) / double-tap (touch) a notehead
 //     shows a pitch tooltip instead of seeking; toggleable in the pill
 //   - OGG loop: click-drag (or touch-drag) across the score sets a loop
@@ -26,6 +32,8 @@
 //   - alphaTab CDN load promise (one <script> per page)
 //   - _svFilename — captured from playSong wrap + arrangement:changed
 //   - _nextInstanceId — monotonic DOM id suffix
+//   - MIDI domain session (one per tab; every instance, including
+//     splitscreen panels, shares it — events route to the focused one)
 
 (function () {
 'use strict';
@@ -52,8 +60,22 @@ const TICK_DELTA_THRESHOLD = 30;
 const DUR_MAP = { 1: 1, 2: 2, 4: 4, 8: 8, 16: 16, 32: 32 };
 
 // localStorage keys for pill-controlled, session-persisted preferences.
-const _SV_STORE_LAYOUT         = 'staffview_layout';
-const _SV_STORE_SCALE          = 'staffview_scale';
+const _SV_STORE_LAYOUT   = 'staffview_layout';
+const _SV_STORE_SCALE    = 'staffview_scale';
+const _SV_STORE_MIDI_PICK = 'staffview_midi_pick';   // JSON {id,name,key}
+const _SV_STORE_MIDI_CH   = 'staffview_midi_ch';
+
+// Hit/miss judgment tolerance — ±100ms, matches keys_highway_3d.
+const HIT_TOLERANCE_S = 0.1;
+
+// Note-detection provider id (capabilities domain).
+const ND_PROVIDER_ID = 'staffview-midi';
+
+// Loopback / passthrough MIDI port names to skip when auto-connecting —
+// mirrors the core midi-input domain's own built-in Web-MIDI provider
+// filter, kept here too since a saved pick predating that filter could
+// still resolve to one.
+const _SV_MIDI_BLOCKLIST_RE = /midi through|^thru\b|^iac\b/i;
 const _SV_STORE_NOTE_EXPLORER  = 'staffview_note_explorer';
 
 // Pitch name lookup tables for _svPitchLabel(), keyed by MIDI pitch class
@@ -80,10 +102,371 @@ let _atLoadPromise    = null;   // memoized alphaTab CDN script load
 function _svReadStore(k)    { try { return localStorage.getItem(k); }     catch (_) { return null; } }
 function _svSaveStore(k, v) { try { localStorage.setItem(k, String(v)); } catch (_) {} }
 
+// ═══════════════════════════════════════════════════════════════════════
+// MIDI input (core midi-input capability domain — window.feedBack.midiInput)
+// ═══════════════════════════════════════════════════════════════════════
+// One shared domain session per tab; every staffview instance (splitscreen
+// panels included) routes through it. Events are delivered only to the
+// currently-FOCUSED instance (_svActiveInst) — in splitscreen that tracks
+// panel focus via the splitscreen plugin's onFocusChange/isCanvasFocused;
+// in the main player there is only ever one panel, so it's always focused.
+// Mirrors plugins/keys_highway_3d's connection pattern (the piano-effort's
+// established contract) rather than staffview's own pre-domain code, which
+// used raw requestMIDIAccess and didn't need the async-race guards below.
+
+let _svMidiReady        = false;  // discover() has succeeded at least once
+let _svMidiInitInFlight = null;   // in-flight discover() promise, deduped
+let _svMidiStateSub     = false;  // subscribed to midi-input:sources-changed
+let _svMidiConnectSeq   = 0;      // generation guard for async _svMidiConnect races
+let _svMidiHandle       = null;   // live session handle (addListener/removeListener)
+let _svMidiListener     = null;   // bound listener currently registered on the handle
+let _svMidiInput        = null;   // selected source descriptor { id, name, key }
+let _svMidiActive       = false;  // true once at least one instance has "resumed" MIDI
+let _svActiveInst       = null;   // factory instance currently receiving MIDI events
+const _svInstances      = new Set();
+
+function _svMi() {
+    const m = window.feedBack && window.feedBack.midiInput;
+    return (m && m.version === 1) ? m : null;
+}
+
+// Domain sources shaped like the old MIDIInput list: { id, name, key }.
+function _svMidiSources() {
+    const mi = _svMi();
+    if (!mi) return [];
+    return mi.listSources().map(s => ({ id: s.sourceId, name: s.label, key: s.logicalSourceKey }));
+}
+
+function _svMidiNotifyDeviceListChanged() {
+    const inputs = _svMidiSources();
+    const selects = document.querySelectorAll('.sv-midi-select');
+    for (const sel of selects) {
+        sel.textContent = '';
+        const noneOpt = document.createElement('option');
+        noneOpt.value = '';
+        noneOpt.textContent = 'None';
+        sel.appendChild(noneOpt);
+        for (const inp of inputs) {
+            const opt = document.createElement('option');
+            opt.value = inp.key || inp.id;
+            opt.textContent = inp.name || inp.id || 'Unknown';
+            sel.appendChild(opt);
+        }
+        sel.value = _svMidiInput ? (_svMidiInput.key || _svMidiInput.id) : '';
+    }
+}
+
+// Detach the live listener + release the domain session (does NOT clear
+// _svMidiReady — a later reconnect should not re-prompt for permission).
+function _svMidiDetach() {
+    // Invalidate any in-flight _svMidiConnect open: a detach driven by
+    // device removal (sources-changed) or an opt-out must supersede a
+    // pending open so it can't resume and install a handle for a now-gone
+    // source.
+    _svMidiConnectSeq += 1;
+    if (_svMidiHandle && _svMidiListener) {
+        try { _svMidiHandle.removeListener(_svMidiListener); } catch (_) {}
+    }
+    const mi = _svMi();
+    if (mi && _svMidiInput) {
+        try { mi.close({ requester: PLUGIN_ID, logicalSourceKey: _svMidiInput.key || ('web-midi::' + _svMidiInput.id) }); }
+        catch (_) {}
+    }
+    _svMidiHandle   = null;
+    _svMidiListener = null;
+    _svMidiInput    = null;
+}
+
+function _svReadSavedMidiPick() {
+    try {
+        const raw = _svReadStore(_SV_STORE_MIDI_PICK);
+        if (raw) {
+            const obj = JSON.parse(raw);
+            if (obj && typeof obj === 'object') {
+                return { id: String(obj.id || ''), name: String(obj.name || ''), key: String(obj.key || '') };
+            }
+        }
+    } catch (_) {}
+    return null;
+}
+
+function _svWriteSavedMidiPick(id, name, key) {
+    _svSaveStore(_SV_STORE_MIDI_PICK, JSON.stringify({ id: id || '', name: name || '', key: key || '' }));
+}
+
+// allowFallback=false (recovery after sources-changed) never substitutes a
+// different device for a currently-absent saved pick — a transient unplug
+// must not silently reassign the user's chosen input; allowFallback=true
+// (first connect) picks the first non-loopback device when there's no
+// saved pick at all.
+function _svMidiAutoConnect(allowFallback) {
+    if (allowFallback === undefined) allowFallback = true;
+    const inputs = _svMidiSources();
+    if (!inputs.length) return;
+    const saved = _svReadSavedMidiPick();
+    if (saved && saved.id === '' && saved.name === '') return;   // explicit "None" opt-out
+    let target = null;
+    if (saved && saved.key)  target = inputs.find(i => i.key === saved.key) || null;
+    if (!target && saved && saved.id) target = inputs.find(i => i.id === saved.id) || null;
+    if (!target && saved && saved.name) {
+        const n = saved.name.toLowerCase();
+        target = inputs.find(i => (i.name || '').toLowerCase() === n) || null;
+    }
+    if (target && _SV_MIDI_BLOCKLIST_RE.test(target.name || '')) target = null;
+    if (!target) {
+        const hasSavedPick = !!(saved && (saved.key || saved.id || saved.name));
+        if (!allowFallback && hasSavedPick) return;
+        target = inputs.find(i => !_SV_MIDI_BLOCKLIST_RE.test(i.name || '')) || inputs[0];
+    }
+    _svMidiConnect(target.id, target.name, target.key);
+}
+
+async function _svMidiConnect(id, name, key) {
+    // Capture our generation AFTER _svMidiDetach()'s own bump, so a later
+    // detach (device removal / new connect / opt-out) reliably supersedes us.
+    _svMidiDetach();
+    const myGen = ++_svMidiConnectSeq;
+    for (const inst of _svInstances) {
+        if (inst && typeof inst._releaseAllHeld === 'function') inst._releaseAllHeld();
+    }
+    _svWriteSavedMidiPick(id || '', name || '', key || '');
+    const mi = _svMi();
+    if ((id || key) && mi) {
+        const src = (key && _svMidiSources().find(s => s.key === key))
+            || (id && _svMidiSources().find(s => s.id === id))
+            || null;
+        if (src) {
+            const lkey = src.key || ('web-midi::' + src.id);
+            _svMidiInput = { id: src.id, name: src.name, key: lkey };
+            if (_svInstances.size === 0) { _svMidiNotifyDeviceListChanged(); return; }
+            try {
+                await mi.select(lkey);
+                const res = await mi.open({ requester: PLUGIN_ID, logicalSourceKey: lkey });
+                // A newer _svMidiConnect (device switch / None / replug) ran
+                // while we awaited open — discard this stale session.
+                if (myGen !== _svMidiConnectSeq) {
+                    if (!_svMidiInput || _svMidiInput.key !== lkey) {
+                        try { mi.close({ requester: PLUGIN_ID, logicalSourceKey: lkey }); } catch (_) {}
+                    }
+                    return;
+                }
+                if (res && res.handle) {
+                    _svMidiHandle = res.handle;
+                    // The domain handle delivers raw MIDI data; adapt to the
+                    // old MIDIMessageEvent shape so _svMidiOnMessage is unchanged.
+                    _svMidiListener = (data) => _svMidiOnMessage({ data });
+                    if (_svMidiActive) _svMidiHandle.addListener(_svMidiListener);
+                } else {
+                    _svMidiInput = null;
+                }
+            } catch (e) {
+                console.warn('[staffview] MIDI open failed:', e);
+                if (myGen === _svMidiConnectSeq) _svMidiInput = null;
+            }
+        }
+    }
+    _svMidiNotifyDeviceListChanged();
+}
+
+// Lazily discovers MIDI access (permission boundary) at most once per page;
+// safe to call from every instance's init() — a repeated call with no live
+// session just re-runs auto-connect.
+function _svMidiInit() {
+    if (_svMidiReady) {
+        if (!_svMidiHandle) _svMidiAutoConnect();
+        return Promise.resolve();
+    }
+    if (_svMidiInitInFlight) return _svMidiInitInFlight;
+    const mi = _svMi();
+    if (!mi) return Promise.resolve();
+    _svMidiInitInFlight = (async () => {
+        try {
+            const r = await mi.discover();   // permission boundary (requestMIDIAccess, in core)
+            if (!r || r.outcome !== 'handled') return;   // denied/unavailable must not latch
+            _svMidiReady = true;
+            if (!_svMidiStateSub && window.feedBack && typeof window.feedBack.on === 'function') {
+                _svMidiStateSub = true;
+                window.feedBack.on('midi-input:sources-changed', () => {
+                    _svMidiNotifyDeviceListChanged();
+                    if (!_svMidiInput) _svMidiAutoConnect(false);   // recovery: saved device only
+                });
+            }
+            _svMidiAutoConnect();
+            _svMidiNotifyDeviceListChanged();
+        } catch (e) {
+            console.warn('[staffview] MIDI access denied:', e);
+        } finally {
+            _svMidiInitInFlight = null;
+        }
+    })();
+    return _svMidiInitInFlight;
+}
+
+// Idempotent: a second live instance (splitscreen) calls this while already
+// active. The domain handle's addListener is Set-backed, but don't rely on
+// the provider de-duping — re-adding here could double-deliver one MIDI
+// note to the focused instance and score a hit plus a duplicate miss.
+function _svMidiResume() {
+    if (_svMidiActive) return;
+    _svMidiActive = true;
+    if (_svMidiHandle && _svMidiListener) {
+        try { _svMidiHandle.addListener(_svMidiListener); } catch (_) {}
+    }
+}
+
+// Called when the LAST live instance is torn down: fully release the
+// shared domain session (not just the listener) so the device/provider
+// session isn't held open after every staffview instance is gone. Re-mount
+// auto-connects from the saved pick; _svMidiReady is intentionally left
+// latched so that doesn't re-prompt for permission.
+function _svMidiReleaseSession() {
+    _svMidiActive = false;
+    _svMidiDetach();
+}
+
+function _svMidiOnMessage(e) {
+    if (!_svActiveInst) return;
+    const savedCh = parseInt(_svReadStore(_SV_STORE_MIDI_CH) || '-1', 10);
+    const msg = _svParseMidiMessage(e.data, savedCh);
+    if (!msg) return;
+    if (msg.type === 'noteOn') {
+        _svActiveInst._handleNoteOn(msg.note, msg.velocity);
+    } else if (msg.type === 'noteOff') {
+        _svActiveInst._handleNoteOff(msg.note);
+    } else if (msg.type === 'sustain') {
+        _svActiveInst._handleSustain(msg.down);
+    }
+}
+
+// Extended splitscreen check — validates the full surface needed for MIDI
+// focus routing (which panel receives MIDI events). Falls back gracefully
+// (main-player fast-path — always focused) if splitscreen lacks the
+// onFocusChange/isCanvasFocused surface.
+function _ssActiveFull() {
+    const ss = window.feedBackSplitscreen || window.slopsmithSplitscreen;
+    if (!ss || typeof ss.isActive !== 'function' || !ss.isActive()) return false;
+    return typeof ss.panelChromeFor  === 'function'
+        && typeof ss.isCanvasFocused === 'function'
+        && typeof ss.onFocusChange   === 'function'
+        && typeof ss.offFocusChange  === 'function';
+}
+
+function _ssIsCanvasFocused(canvas) {
+    if (!_ssActiveFull()) return true;
+    const ss = window.feedBackSplitscreen || window.slopsmithSplitscreen;
+    return !!(ss && typeof ss.isCanvasFocused === 'function' && ss.isCanvasFocused(canvas));
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// notedetect coexistence — suppress the generic note_detect plugin's
+// default singleton while a staffview instance is active (staffview owns
+// its own MIDI-based note detection over the same domain).
+// ═══════════════════════════════════════════════════════════════════════
+
+function _svSuppressNoteDetect(on) {
+    const api = window.createNoteDetector;
+    if (!api || typeof api.setDefaultSuppressed !== 'function') return;
+    if (on) {
+        api.setDefaultSuppressed(true);
+    } else if (_svInstances.size === 0) {
+        api.setDefaultSuppressed(false);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Note-detection capability (core domain) — registration + reporting
+// ═══════════════════════════════════════════════════════════════════════
+// staffview registers once as a 'midi' provider (idempotent across
+// instances/song loads), then each instance opens its own context-scoped
+// binding per chart load (closed on song switch / teardown) — mirrors
+// plugins/keys_highway_3d's _ndEnsureProvider / open-binding pattern.
+
+let _svNdProviderRegistered = false;
+
+function _svCapsApi() {
+    const c = window.feedBack && window.feedBack.capabilities;
+    return (c && c.version === 1 && typeof c.command === 'function') ? c : null;
+}
+
+async function _svCapCommand(domain, name, payload, reason) {
+    const caps = _svCapsApi();
+    if (!caps) return null;
+    try {
+        const r = await caps.command(domain, name, {
+            requester: PLUGIN_ID,
+            source:    PLUGIN_ID,
+            origin:    'system',
+            reason:    reason || ('Staff View ' + domain + '.' + name),
+            payload:   payload || {},
+        });
+        return (r && r.outcome === 'handled') ? (r.payload || {}) : null;
+    } catch (_) { return null; }
+}
+
+async function _svNdEnsureProvider() {
+    if (_svNdProviderRegistered) return;
+    const p = await _svCapCommand('note-detection', 'register-provider', {
+        providerId: ND_PROVIDER_ID,
+        label:      'Staff View MIDI',
+        kind:       'midi',
+        primitives: ['verify.target'],
+    }, 'Register the Staff View MIDI note-detection provider');
+    if (p) _svNdProviderRegistered = true;
+}
+
+// Called when the LAST live instance is torn down — mirrors
+// _svMidiReleaseSession's "only the last one out unregisters" symmetry, so
+// the provider stays registered as long as any staffview instance (e.g. a
+// splitscreen sibling) is still alive.
+async function _svNdUnregisterProvider() {
+    if (!_svNdProviderRegistered) return;
+    await _svCapCommand('note-detection', 'unregister-provider', {
+        providerId: ND_PROVIDER_ID,
+    }, 'Unregister the Staff View MIDI note-detection provider');
+    _svNdProviderRegistered = false;
+}
+
+// Hit/miss observability events — consumers own judgment, the domain only
+// carries the result (spec 009 doctrine).
+function _svNdReport(hit, midi, bindingId) {
+    const nd = window.feedBack && window.feedBack.noteDetection;
+    if (!nd || nd.version !== 1) return;
+    try {
+        const payload = {
+            bindingId: bindingId || null,
+            providerId: ND_PROVIDER_ID,
+            midi,
+            hit,
+        };
+        if (hit) nd.reportHit(payload); else nd.reportMiss(payload);
+    } catch (_) {}
+}
+
 // Zoom clamp: 50%-200% in 5% steps. Pulled out of _svSetScale so the pure
 // math is independently testable (tests/zoom.test.js).
 function _svClampScale(value) {
     return Math.max(0.5, Math.min(2.0, Math.round(value * 20) / 20));
+}
+
+// Parses a raw 1-3 byte MIDI message into a normalized event, or null if
+// it's not one of the three messages staffview cares about (or filtered
+// out by the channel setting). savedCh is the user's saved channel
+// preference: -1 means "All channels".
+//   Note On  (0x9n, velocity > 0)                → { type: 'noteOn',  note, velocity }
+//   Note Off (0x8n, or 0x9n with velocity === 0)  → { type: 'noteOff', note }
+//   Sustain  (0xBn, controller 64 / CC64)         → { type: 'sustain', down }
+function _svParseMidiMessage(data, savedCh) {
+    if (!data || data.length < 2) return null;
+    const status   = data[0];
+    const note     = data[1];
+    const velocity = data[2] || 0;
+    const ch = status & 0x0F;
+    if (savedCh >= 0 && ch !== savedCh) return null;
+    const cmd = status & 0xF0;
+    if (cmd === 0x90 && velocity > 0) return { type: 'noteOn', note, velocity };
+    if (cmd === 0x80 || (cmd === 0x90 && velocity === 0)) return { type: 'noteOff', note };
+    if (cmd === 0xB0 && note === 64) return { type: 'sustain', down: velocity >= 64 };
+    return null;
 }
 
 // Normalizes the two possible loop-notification payload shapes into
@@ -578,6 +961,48 @@ function createFactory() {
     let _svLastTick     = -1;
     let _svLatestBeats  = null; // bundle.beats snapshot
 
+    // ── MIDI focus / lifecycle state ────────────────────────────────
+    // Splitscreen can host multiple staffview panels; only the FOCUSED
+    // one's _svActiveInst assignment receives routed MIDI events (module-
+    // level _svUpdateFocusState / _ssIsCanvasFocused). The main player has
+    // only one panel, so focus is always true there.
+    let _svInstanceDestroyed = false;
+    let _svIsFocused         = false;
+    let _svFocusRegistered   = false;
+
+    // ── MIDI held-note bookkeeping ───────────────────────────────────
+    // Currently unused beyond _svReleaseAllHeld's no-op-without-a-synth
+    // stub — kept as real Map/Set state (not deferred to a later PR)
+    // because _handleNoteOff's sustain-hold semantics depend on it, and
+    // the monitor synth PR will read/drive this same state rather than
+    // introduce a parallel copy.
+    const _svHeldNotes      = new Map();   // midi → velocity
+    let _svSustainOn        = false;
+    const _svSustainedNotes = new Set();
+
+    // ── Judgment note lists and counters ────────────────────────────
+    // Built from the loaded score (_svBuildJudgeLists) once alphaTab's
+    // scoreLoaded fires. noteKey = staffIdx|barIdx|absStart|midi — stable
+    // across re-layouts (page/horizontal toggle, zoom) since it doesn't
+    // depend on rendered position.
+    let _svJudgeNotesAll = null;   // [{midi,t,hand,noteKey}], sorted by t
+    let _svJudgeNotesRH  = null;   // hand=0 (top staff) subset
+    let _svJudgeNotesLH  = null;   // hand=1 (bottom staff) subset
+    let _svHits = 0, _svMisses = 0, _svStreak = 0, _svBestStreak = 0;
+    const _svHitNoteKeys = new Set();   // deduplicates per-note hit claims
+    // scoreLoaded usually fires before the bundle.beats stream arrives, so
+    // the initial judge times come from _svBeatToSeconds's crude constant-BPM
+    // fallback (no lead-in). Rebuild them once real beats show up so judge
+    // times share _handleNoteOn's real-beats timebase. Guarded to rebuild at
+    // most once per song; reset in scoreLoaded.
+    let _svJudgeRebuiltFromBeats = false;
+
+    // ── Note-detection binding (this instance's chart-scoped context) ──
+    let _svNdBindingId = null;
+    let _svNdLoadSeq    = 0;   // bumped per chart load; guards a stale
+                               // open-binding response from a rapid song
+                               // switch landing after the next chart is
+                               // already active
     // ── Note explorer (alt-click / double-tap pitch tooltip) ────────
     // _svNoteExplorerEnabled: pill checkbox, persisted, default on.
     // _svTooltip: reused div, created lazily on first show.
@@ -675,6 +1100,7 @@ function createFactory() {
         if (_svContainer) return _svContainer;
         const mount = _resolveMount(_svHighwayCanvas);
         if (!mount) return null;
+        _svSuppressNoteDetect(true);
 
         if (getComputedStyle(mount).position === 'static') {
             _svPrevMountPos = mount.style.position;
@@ -1590,6 +2016,64 @@ function createFactory() {
         const btnCls = _isV3()
             ? 'v3-pop-btn'
             : 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition';
+        const selCls = _isV3()
+            ? 'v3-pop-btn'
+            : 'bg-dark-600 rounded-lg text-xs text-gray-300';
+
+        // ── MIDI section ───────────────────────────────────────────
+        // Device + channel picker. Always visible (not gated on a loaded
+        // chart) so the user can set up their device ahead of time. The
+        // device <select> is kept in sync by _svMidiNotifyDeviceListChanged
+        // via its shared 'sv-midi-select' class — every mounted pill's
+        // select updates together.
+        const midiSection = document.createElement('div');
+
+        const midiLabel = document.createElement('span');
+        midiLabel.className = 'section-practice-label';
+        midiLabel.textContent = 'MIDI';
+
+        const midiRow = document.createElement('div');
+        midiRow.className = 'section-practice-controls-row';
+        midiRow.style.marginTop = '4px';
+
+        const midiSel = document.createElement('select');
+        midiSel.className = 'sv-midi-select ' + selCls;
+        midiSel.title = 'MIDI input device';
+        midiSel.style.flex = '1 1 auto';
+        midiSel.style.minWidth = '0';
+        const midiNoneOpt = document.createElement('option');
+        midiNoneOpt.value = '';
+        midiNoneOpt.textContent = 'None';
+        midiSel.appendChild(midiNoneOpt);
+        midiSel.addEventListener('change', () => {
+            const key = midiSel.value;
+            const src = _svMidiSources().find(s => (s.key || s.id) === key);
+            _svMidiConnect(src ? src.id : '', src ? src.name : '', key);
+        });
+
+        const midiChSel = document.createElement('select');
+        midiChSel.className = selCls;
+        midiChSel.title = 'MIDI channel (All or 1-16)';
+        midiChSel.style.marginLeft = '4px';
+        const allOpt = document.createElement('option');
+        allOpt.value = '-1';
+        allOpt.textContent = 'All ch';
+        midiChSel.appendChild(allOpt);
+        for (let ch = 1; ch <= 16; ch++) {
+            const o = document.createElement('option');
+            o.value = String(ch - 1);
+            o.textContent = 'Ch ' + ch;
+            midiChSel.appendChild(o);
+        }
+        midiChSel.value = _svReadStore(_SV_STORE_MIDI_CH) || '-1';
+        midiChSel.addEventListener('change', () => {
+            _svSaveStore(_SV_STORE_MIDI_CH, midiChSel.value);
+        });
+
+        midiRow.appendChild(midiSel);
+        midiRow.appendChild(midiChSel);
+        midiSection.appendChild(midiLabel);
+        midiSection.appendChild(midiRow);
 
         // ── NOTE EXPLORER section ──────────────────────────────────
         // Single checkbox for now. A future MIDI note-detection PR is
@@ -1714,6 +2198,7 @@ function createFactory() {
         zoomSection.appendChild(zoomRow);
         zoomSection.appendChild(resetWrap);
 
+        popover.appendChild(midiSection);
         popover.appendChild(explorerSection);
         popover.appendChild(layoutSection);
         popover.appendChild(zoomSection);
@@ -1778,6 +2263,16 @@ function createFactory() {
             footer.insertBefore(wrap, footer.firstChild);
         }
         _svPillWrap = wrap;
+
+        // Now that midiSel is actually attached to the document,
+        // document.querySelectorAll('.sv-midi-select') inside
+        // _svMidiNotifyDeviceListChanged can find it — populate it with
+        // whatever the domain already knows (pill re-created mid-session,
+        // e.g. splitscreen panel remount, or the device connected before
+        // this pill existed) instead of waiting for the next
+        // sources-changed event, which may never come if nothing changes
+        // again this session.
+        _svMidiNotifyDeviceListChanged();
     }
 
     function _svRemovePill() {
@@ -1977,6 +2472,10 @@ function createFactory() {
             if (_svInitToken !== myToken) return;
             _svAtBeats  = _svBuildBeatTimeline(score);
             _svLastBeat = null;
+            _svJudgeRebuiltFromBeats = false;
+            _svBuildJudgeLists(score);
+            const seq = _svNdLoadSeq;
+            _svNdOpenBindingForChart(seq);
         });
 
         // ── Render finished → reveal container ────────────────────
@@ -2112,6 +2611,7 @@ function createFactory() {
         _svMeasures      = [];
         _svNotationReady = false;
         _svRendered      = false;
+        _svNdLoadSeq++;   // guards a stale open-binding response from a superseded chart load
 
         _svOpenWs(filename, arrIdx, myToken);
     }
@@ -2310,6 +2810,193 @@ function createFactory() {
         }
     }
 
+    // ── Focus state management ──────────────────────────────────────
+    // instance is declared at the end of createFactory; closed over by
+    // reference — only called after init() has run, by which point the
+    // assignment below has already happened.
+
+    function _svUpdateFocusState() {
+        if (_svInstanceDestroyed || !_svHighwayCanvas) return;
+        const shouldFocus = _ssIsCanvasFocused(_svHighwayCanvas);
+        if (shouldFocus && !_svIsFocused) {
+            _svIsFocused  = true;
+            _svActiveInst = instance;   // eslint-disable-line no-use-before-define
+        } else if (!shouldFocus && _svIsFocused) {
+            _svIsFocused = false;
+            _svReleaseAllHeld();
+            if (_svActiveInst === instance) _svActiveInst = null;   // eslint-disable-line no-use-before-define
+        }
+    }
+
+    // No-op until the monitor synth PR adds actual audio to release — kept
+    // as a real function (not deleted) since it's part of the fixed MIDI
+    // handler interface _svMidiConnect/_svUpdateFocusState call by name.
+    function _svReleaseAllHeld() {
+        _svHeldNotes.clear();
+        _svSustainedNotes.clear();
+        _svSustainOn = false;
+    }
+
+    function _svGetCurrentTime() {
+        try {
+            const audio = document.getElementById('audio');
+            if (audio) return audio.currentTime;
+        } catch (_) {}
+        return null;
+    }
+
+    // ── Judgment note list builder ──────────────────────────────────
+    // Walks score.tracks[0].staves to build per-hand and combined note
+    // lists indexed by time. Called from scoreLoaded, after _svAtBeats is
+    // built (_svBeatToSeconds needs it for songs without a full bundle.beats
+    // stream yet).
+
+    function _svBuildJudgeLists(score) {
+        const all = [], rh = [], lh = [];
+        try {
+            const staves = score.tracks[0].staves;
+            for (let si = 0; si < staves.length; si++) {
+                for (const bar of (staves[si].bars || [])) {
+                    for (const voice of (bar.voices || [])) {
+                        for (const beat of (voice.beats || [])) {
+                            const t = _svBeatToSeconds(beat);
+                            if (t === null) continue;
+                            const abs = typeof beat.absoluteDisplayStart === 'number'
+                                ? beat.absoluteDisplayStart : 0;
+                            for (let ni = 0; ni < (beat.notes || []).length; ni++) {
+                                const note = beat.notes[ni];
+                                if (note.isTieDestination) continue; // no new note-on expected
+                                const midi = note.octave * 12 + note.tone;
+                                if (midi < 0 || midi > 127) continue;
+                                const entry = {
+                                    midi, t, hand: si,
+                                    noteKey: si + '|' + (bar.index || 0) + '|' + abs + '|' + midi,
+                                };
+                                all.push(entry);
+                                if (si === 0) rh.push(entry);
+                                else          lh.push(entry);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (_) {}
+        all.sort((a, b) => a.t - b.t);
+        rh.sort((a, b) => a.t - b.t);
+        lh.sort((a, b) => a.t - b.t);
+        _svJudgeNotesAll = all;
+        _svJudgeNotesRH  = rh;
+        _svJudgeNotesLH  = lh;
+        _svHitNoteKeys.clear();
+    }
+
+    // Returns the MIDI range spanned by the loaded score's judge notes, or
+    // null if there are none yet. Used as note-detection binding context.
+    function _svJudgeMidiRange() {
+        if (!_svJudgeNotesAll || !_svJudgeNotesAll.length) return null;
+        let lo = 127, hi = 0;
+        for (const e of _svJudgeNotesAll) {
+            if (e.midi < lo) lo = e.midi;
+            if (e.midi > hi) hi = e.midi;
+        }
+        return { activeLow: lo, activeHigh: hi };
+    }
+
+    // ── Hit/miss judgment ────────────────────────────────────────────
+    // Returns the matched noteKey on hit (also recorded, to prevent
+    // double-counting the same chart note), or null on miss. ±100ms
+    // tolerance (HIT_TOLERANCE_S), matching keys_highway_3d.
+
+    function _svJudgeHit(playedMidi, playedTime) {
+        const notes = _svJudgeNotesAll;
+        if (!notes || !notes.length) return null;
+        for (let i = 0; i < notes.length; i++) {
+            const n = notes[i];
+            if (n.t > playedTime + HIT_TOLERANCE_S + 0.5) break;
+            if (n.t < playedTime - HIT_TOLERANCE_S - 0.5) continue;
+            if (n.midi === playedMidi
+                    && Math.abs(n.t - playedTime) <= HIT_TOLERANCE_S
+                    && !_svHitNoteKeys.has(n.noteKey)) {
+                _svHitNoteKeys.add(n.noteKey);
+                _svHits++;
+                _svStreak++;
+                if (_svStreak > _svBestStreak) _svBestStreak = _svStreak;
+                return n.noteKey;
+            }
+        }
+        _svMisses++;
+        _svStreak = 0;
+        return null;
+    }
+
+    // ── MIDI event handlers (called by the module-level _svMidiOnMessage,
+    // routed to whichever instance is currently focused) ────────────────
+
+    function _handleNoteOn(midi, velocity) {
+        if (midi < 0 || midi > 127) return;
+        _svHeldNotes.set(midi, velocity);
+        const t = _svGetCurrentTime();
+        if (t !== null) {
+            const hitKey = _svJudgeHit(midi, t);
+            _svNdReport(hitKey !== null, midi, _svNdBindingId);
+        }
+    }
+
+    function _handleNoteOff(midi) {
+        if (midi < 0 || midi > 127) return;
+        if (_svSustainOn) { _svSustainedNotes.add(midi); return; }
+        _svHeldNotes.delete(midi);
+    }
+
+    function _handleSustain(down) {
+        if (down) {
+            _svSustainOn = true;
+        } else {
+            _svSustainOn = false;
+            for (const midi of _svSustainedNotes) _svHeldNotes.delete(midi);
+            _svSustainedNotes.clear();
+        }
+    }
+
+    // ── Note-detection binding (per chart load) ─────────────────────
+    // Closes any previous binding, ensures the (idempotent) provider
+    // registration, then opens a binding scoped to this chart's judged
+    // MIDI range. All guarded — degrades silently when the note-detection
+    // host is absent. `seq` is this instance's chart-load sequence: a
+    // rapid song switch can land a stale open-binding response after the
+    // next chart is already active, which would misattribute hit/miss
+    // events and leak the live binding — so the write-back is gated on
+    // the same supersession check the notation load itself uses, and a
+    // superseded binding is closed instead of stored.
+
+    async function _svNdOpenBindingForChart(seq) {
+        if (_svNdBindingId) {
+            _svCapCommand('note-detection', 'close-binding', { bindingId: _svNdBindingId },
+                'Song changed — close the previous notation binding');
+            _svNdBindingId = null;
+        }
+        // Registration must not depend on this chart having judge notes —
+        // an empty/failed range must still leave staffview registered as a
+        // provider (matches keys_highway_3d: register-provider is
+        // unconditional). Only the per-chart BINDING is skipped without a
+        // range.
+        await _svNdEnsureProvider();
+        const range = _svJudgeMidiRange();
+        if (!range) return;
+        const p = await _svCapCommand('note-detection', 'open-binding', {
+            providerId: ND_PROVIDER_ID,
+            context: { arrangement: 'notation', midiLow: range.activeLow, midiHigh: range.activeHigh },
+        }, 'Open a notation verify binding for the loaded chart');
+        const bindingId = p && p.bindingId;
+        if (!bindingId) return;
+        if (seq !== _svNdLoadSeq) {
+            _svCapCommand('note-detection', 'close-binding', { bindingId },
+                'Superseded by a newer chart load');
+            return;
+        }
+        _svNdBindingId = bindingId;
+    }
+
     // ── Teardown ───────────────────────────────────────────────────
 
     function _svTeardown(restoreCanvas) {
@@ -2361,6 +3048,7 @@ function createFactory() {
 
         _svRemoveContainer();
         _svRemoveErrorBanner();
+        _svSuppressNoteDetect(false);
 
         if (restoreCanvas && _svHighwayCanvas) {
             _svHighwayCanvas.style.visibility = _svPrevVisibility;
@@ -2371,8 +3059,14 @@ function createFactory() {
     }
 
     // ── setRenderer contract ───────────────────────────────────────
+    // `instance` is declared as a const (not returned anonymously) so
+    // _svUpdateFocusState can close over it by reference — the ref is only
+    // dereferenced after init() has run, by which point this assignment
+    // has already happened.
 
-    return {
+    const _onFocusChange = () => _svUpdateFocusState();
+
+    const instance = {
         contextType: '2d',   // we don't paint to the canvas ourselves;
                              // declared so the factory doesn't trigger
                              // an unnecessary canvas swap.
@@ -2390,6 +3084,27 @@ function createFactory() {
 
             window.addEventListener('resize', _onWinResize);
 
+            // Wire focus routing once per instance. In splitscreen,
+            // focus-change events route MIDI to the focused panel; the
+            // main player has only one panel so focus is always true.
+            _svInstanceDestroyed = false;
+            _svInstances.add(instance);
+            if (!_svFocusRegistered) {
+                _svFocusRegistered = true;
+                if (_ssActiveFull()) {
+                    const ss = window.feedBackSplitscreen || window.slopsmithSplitscreen;
+                    if (typeof ss.onFocusChange === 'function') ss.onFocusChange(_onFocusChange);
+                }
+            }
+            if (_ssActiveFull()) {
+                _svUpdateFocusState();
+            } else {
+                _svActiveInst = instance;
+                _svIsFocused  = true;
+            }
+            _svMidiResume();
+            _svMidiInit();   // lazy MIDI access — no-op if already initialised
+
             const songInfo = (bundle && bundle.songInfo) || {};
             const filename = (typeof songInfo.filename === 'string' && songInfo.filename)
                 || _svFilename;
@@ -2404,6 +3119,22 @@ function createFactory() {
             if (!_isReady || !bundle) return;
 
             _svLatestBeats = bundle.beats || null;
+
+            // Judge times were built at scoreLoaded from the constant-BPM
+            // fallback (beats hadn't arrived). Rebuild once on the real beats
+            // stream so judge times match _handleNoteOn's timebase.
+            if (!_svJudgeRebuiltFromBeats
+                    && _svLatestBeats && _svLatestBeats.length >= 2
+                    && _svApi && _svApi.score && _svJudgeNotesAll) {
+                _svJudgeRebuiltFromBeats = true;
+                // Rebuild only changes judge times; noteKeys are tick/index-
+                // based and stable. _svBuildJudgeLists clears _svHitNoteKeys,
+                // so preserve already-counted hits to avoid double-scoring
+                // notes hit before the real beats landed.
+                const priorHits = new Set(_svHitNoteKeys);
+                _svBuildJudgeLists(_svApi.score);
+                for (const k of priorHits) _svHitNoteKeys.add(k);
+            }
 
             // Detect song/arrangement change → open a new WS.
             const songInfo = bundle.songInfo || {};
@@ -2439,12 +3170,38 @@ function createFactory() {
         },
 
         destroy() {
+            _svInstanceDestroyed = true;
+            _svInstances.delete(instance);
+            if (_svActiveInst === instance) _svActiveInst = null;
+            if (_svFocusRegistered && _ssActiveFull()) {
+                const ss = window.feedBackSplitscreen || window.slopsmithSplitscreen;
+                if (typeof ss.offFocusChange === 'function') ss.offFocusChange(_onFocusChange);
+                _svFocusRegistered = false;
+            }
+            if (_svNdBindingId) {
+                _svCapCommand('note-detection', 'close-binding', { bindingId: _svNdBindingId },
+                    'Instance torn down — close the notation binding');
+                _svNdBindingId = null;
+            }
+            if (_svInstances.size === 0) {
+                _svMidiReleaseSession();
+                _svNdUnregisterProvider();
+            }
             _isReady = false;
             _svInitToken++;
             window.removeEventListener('resize', _onWinResize);
             _svTeardown(/* restoreCanvas */ true);
         },
+
+        // ── MIDI handler entry-points (called by the module-level
+        // _svMidiOnMessage, routed to whichever instance is focused) ──
+        _releaseAllHeld: _svReleaseAllHeld,
+        _handleNoteOn,
+        _handleNoteOff,
+        _handleSustain,
     };
+
+    return instance;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
