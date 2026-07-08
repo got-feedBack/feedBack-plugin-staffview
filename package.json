@@ -1,6 +1,6 @@
 {
   "name": "feedback-plugin-staffview",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "FeedBack staff-view (grand staff notation) plugin — node:test suite for the browser-free host-integration helpers in screen.js",
   "scripts": {

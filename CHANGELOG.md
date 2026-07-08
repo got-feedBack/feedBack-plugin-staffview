@@ -6,7 +6,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased]
+## [0.3.0] — 2026-07-08
 
 ### Added
 
@@ -34,8 +34,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     Platform/click seeks re-home the gate to the seeked position.
   - Optional **preroll count-in** (one bar of metronome clicks, persisted) when
     playback resumes; its `AudioContext` is closed on teardown.
-  - Judged notes flow through the same core note-detection / stats channels as
-    free-play (`note:hit` / `note:miss`, `reportHit` / `reportMiss`).
+  - Study is unscored practice: notes report to the core note-detection domain
+    (`reportHit` / `reportMiss`) for observability only — see Fixed below.
 
 - **Score-surface feedback** — visual and statistical feedback layered onto
   the notation as you play.
@@ -310,6 +310,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **v3 UI support** — the score container insets no longer assume the v2
   HUD/controls heights when those elements are `position:absolute` overlays
   in v3 (`window.slopsmith.uiVersion === 'v3'`).
+
+### Fixed
+
+- **Study mode is now unscored practice** — a gate only advances once played
+  correctly, so a run is always ~100% by construction. Study no longer
+  mutates the free-play tallies (`_svHits`/`_svMisses`/per-hand), claims
+  notes in the sweep sets, or emits `note:hit`/`note:miss` — it only advances
+  the gate and reports to the note-detection domain (observability). Fixes a
+  real bug this uncovered: the free-play time-sweep (and its backward-seek
+  rollback) was still running under study's own gate accounting, corrupting
+  the tally on a study seek-back. Core's live HUD is now hidden while study
+  is active instead of showing a meaningless (or corrupted) accuracy.
+- **Study audio focus-gated in split-screen** — the preroll/gate-pause loop
+  and the `seeked` handler now run only for the focused instance, so two
+  Study panels no longer fight over the shared `#audio` element. Also resets
+  the pause/play edge tracker on focus loss, so a stale read on refocus can't
+  fire a false preroll mid-playback.
+- **Guarded `audio.play()` promise rejection** in study resume/preroll so a
+  rejected play (autoplay policy, decode error) can't leave playback stuck
+  with the preroll-resuming flag pinned true.
+- **Volume slider accessible name** — added `aria-label`/`title` so screen
+  readers don't announce it as an unlabeled slider.
 
 ---
 
