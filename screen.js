@@ -76,8 +76,6 @@ const ND_PROVIDER_ID = 'staffview-midi';
 // filter, kept here too since a saved pick predating that filter could
 // still resolve to one.
 const _SV_MIDI_BLOCKLIST_RE = /midi through|^thru\b|^iac\b/i;
-const _SV_STORE_LAYOUT         = 'staffview_layout';
-const _SV_STORE_SCALE          = 'staffview_scale';
 const _SV_STORE_NOTE_EXPLORER  = 'staffview_note_explorer';
 
 // Pitch name lookup tables for _svPitchLabel(), keyed by MIDI pitch class
