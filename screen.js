@@ -479,6 +479,7 @@ let _svAudioCtx        = null;
 let _svSynthGain       = null;
 let _svSynthPlayer     = null;
 let _svSynthPreset     = null;
+let _svSynthInitPromise = null;   // in-flight _svSynthInit() promise (race guard)
 let _svWafScriptLoaded = false;
 const _svNoteEnvelopes = new Map();   // midi → WebAudioFont envelope handle
 let _svSynthVolume        = parseFloat(_svReadStore(_SV_STORE_SYNTH_VOL) || '0.7');
@@ -489,23 +490,35 @@ let _svSynthInstrumentIdx = parseInt(_svReadStore(_SV_STORE_SYNTH_INST) || '0', 
 // repeatedly (no-op once _svSynthPlayer exists) — called from the first
 // note-on so there's no unprompted AudioContext creation (autoplay policy)
 // and no upfront cost for keyboards that are never played.
-async function _svSynthInit() {
-    if (_svSynthPlayer) return;
-    try {
-        if (!_svWafScriptLoaded) {
-            await _svLoadWafScript(WAF_PLAYER_URL);
-            _svWafScriptLoaded = true;
+function _svSynthInit() {
+    if (_svSynthPlayer) return Promise.resolve();
+    // Memoize the in-flight promise so a chord (N near-simultaneous note-ons,
+    // each fire-and-forget calling _svSynthInit) runs the body ONCE instead of
+    // racing N AudioContexts past the null-player guard and orphaning all but
+    // the last (browsers cap ~6 live contexts).
+    if (_svSynthInitPromise) return _svSynthInitPromise;
+    _svSynthInitPromise = (async () => {
+        try {
+            if (!_svWafScriptLoaded) {
+                await _svLoadWafScript(WAF_PLAYER_URL);
+                _svWafScriptLoaded = true;
+            }
+            if (typeof WebAudioFontPlayer === 'undefined') return;
+            _svAudioCtx  = new (window.AudioContext || window.webkitAudioContext)();
+            _svSynthGain = _svAudioCtx.createGain();
+            _svSynthGain.gain.value = _svSynthVolume;
+            _svSynthGain.connect(_svAudioCtx.destination);
+            _svSynthPlayer = new WebAudioFontPlayer();
+            await _svSynthLoadInstrument(_svSynthInstrumentIdx);
+        } catch (e) {
+            console.warn('[staffview] Synth init failed:', e);
+        } finally {
+            // If the player never came up, clear the memo so a later note-on
+            // retries instead of latching onto a dead promise forever.
+            if (!_svSynthPlayer) _svSynthInitPromise = null;
         }
-        if (typeof WebAudioFontPlayer === 'undefined') return;
-        _svAudioCtx  = new (window.AudioContext || window.webkitAudioContext)();
-        _svSynthGain = _svAudioCtx.createGain();
-        _svSynthGain.gain.value = _svSynthVolume;
-        _svSynthGain.connect(_svAudioCtx.destination);
-        _svSynthPlayer = new WebAudioFontPlayer();
-        await _svSynthLoadInstrument(_svSynthInstrumentIdx);
-    } catch (e) {
-        console.warn('[staffview] Synth init failed:', e);
-    }
+    })();
+    return _svSynthInitPromise;
 }
 
 async function _svSynthLoadInstrument(idx) {
@@ -531,7 +544,16 @@ function _svSynthEnsureCtx() {
     if (_svAudioCtx && _svAudioCtx.state === 'suspended') _svAudioCtx.resume();
 }
 
-function _svSynthNoteOn(midi) {
+// Maps a MIDI velocity (0–127) to a WebAudioFont per-note gain (0–1);
+// undefined velocity → full (1). Master volume is applied once by _svSynthGain,
+// so the per-note value must be velocity — NOT _svSynthVolume, which would
+// square the loudness (vol²) and drop dynamics entirely.
+function _svVelocityGain(velocity) {
+    if (velocity == null) return 1;
+    return Math.max(0, Math.min(1, velocity / 127));
+}
+
+function _svSynthNoteOn(midi, velocity) {
     if (!_svSynthPlayer || !_svSynthPreset || !_svAudioCtx || !_svSynthGain) return;
     _svSynthEnsureCtx();
     const existing = _svNoteEnvelopes.get(midi);
@@ -540,7 +562,7 @@ function _svSynthNoteOn(midi) {
         // Duration 999s (effectively "until noteOff") — sustain is driven
         // by explicit cancel(), not the WebAudioFont library's own envelope.
         const envelope = _svSynthPlayer.queueWaveTable(
-            _svAudioCtx, _svSynthGain, _svSynthPreset, 0, midi, 999, _svSynthVolume
+            _svAudioCtx, _svSynthGain, _svSynthPreset, 0, midi, 999, _svVelocityGain(velocity)
         );
         _svNoteEnvelopes.set(midi, envelope);
     } catch (_) {}
@@ -2286,9 +2308,9 @@ function createFactory() {
 
     // Thin wrappers so _handleNoteOn/_handleNoteOff read as "judge + sound"
     // rather than reaching into the module-level synth directly.
-    function _svMonitorNoteOn(midi) {
+    function _svMonitorNoteOn(midi, velocity) {
         _svSynthInit();   // no-op once already initialised
-        _svSynthNoteOn(midi);
+        _svSynthNoteOn(midi, velocity);
     }
     function _svMonitorNoteOff(midi) { _svSynthNoteOff(midi); }
 
@@ -2390,7 +2412,7 @@ function createFactory() {
     function _handleNoteOn(midi, velocity) {
         if (midi < 0 || midi > 127) return;
         _svHeldNotes.set(midi, velocity);
-        _svMonitorNoteOn(midi);
+        _svMonitorNoteOn(midi, velocity);
         const t = _svGetCurrentTime();
         if (t !== null) {
             const hitKey = _svJudgeHit(midi, t);
