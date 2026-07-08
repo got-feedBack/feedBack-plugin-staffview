@@ -29,6 +29,13 @@ function load() {
 }
 const { _svParseMidiMessage } = load();
 
+// _svNdReport: compiled standalone with window/ND_PROVIDER_ID injected.
+const ndReportSrc = grab(/function _svNdReport\(hit, midi, bindingId\) \{[\s\S]*?\n\}/, '_svNdReport');
+function loadNdReport(win) {
+    return new Function('window', 'ND_PROVIDER_ID',
+        '"use strict";' + ndReportSrc + '\nreturn _svNdReport;')(win, 'staffview');
+}
+
 // Status byte builders. Channel is the low nibble (0-15).
 const noteOn  = (ch, note, vel) => [0x90 | ch, note, vel];
 const noteOff = (ch, note, vel) => [0x80 | ch, note, vel === undefined ? 64 : vel];
@@ -91,6 +98,36 @@ test('returns null for missing/undefined data', () => {
 
 test('returns null for an unrecognized command (e.g. pitch bend 0xE0)', () => {
     assert.equal(_svParseMidiMessage([0xE0, 0, 64], -1), null);
+});
+
+// ── _svNdReport: methods must be called bound to `nd` ─────────────────────
+// The timebase-rebuild fix (#1) needs the host/DOM to exercise, so it isn't
+// unit-tested here. This pins the bind fix (#2): reportHit/reportMiss are
+// invoked with `nd` as receiver, so `this` is defined inside them.
+
+function ndMock() {
+    const calls = [];
+    const record = (name) => function (payload) { calls.push({ name, self: this, payload }); };
+    const nd = { version: 1, reportHit: record('reportHit'), reportMiss: record('reportMiss') };
+    return { window: { feedBack: { noteDetection: nd } }, nd, calls };
+}
+
+test('_svNdReport calls reportHit bound to nd (this === nd)', () => {
+    const { window, nd, calls } = ndMock();
+    loadNdReport(window)(true, 60, 'bind-1');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].name, 'reportHit');
+    assert.equal(calls[0].self, nd);   // fails if the method is detached
+    assert.deepEqual(calls[0].payload, { bindingId: 'bind-1', providerId: 'staffview', midi: 60, hit: true });
+});
+
+test('_svNdReport calls reportMiss bound to nd (this === nd)', () => {
+    const { window, nd, calls } = ndMock();
+    loadNdReport(window)(false, 62, null);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].name, 'reportMiss');
+    assert.equal(calls[0].self, nd);
+    assert.equal(calls[0].payload.hit, false);
 });
 
 test('defaults velocity to 0 when the third byte is absent (2-byte message)', () => {

@@ -417,12 +417,13 @@ function _svNdReport(hit, midi, bindingId) {
     const nd = window.feedBack && window.feedBack.noteDetection;
     if (!nd || nd.version !== 1) return;
     try {
-        (hit ? nd.reportHit : nd.reportMiss)({
+        const payload = {
             bindingId: bindingId || null,
             providerId: ND_PROVIDER_ID,
             midi,
             hit,
-        });
+        };
+        if (hit) nd.reportHit(payload); else nd.reportMiss(payload);
     } catch (_) {}
 }
 
@@ -888,6 +889,12 @@ function createFactory() {
     let _svJudgeNotesLH  = null;   // hand=1 (bottom staff) subset
     let _svHits = 0, _svMisses = 0, _svStreak = 0, _svBestStreak = 0;
     const _svHitNoteKeys = new Set();   // deduplicates per-note hit claims
+    // scoreLoaded usually fires before the bundle.beats stream arrives, so
+    // the initial judge times come from _svBeatToSeconds's crude constant-BPM
+    // fallback (no lead-in). Rebuild them once real beats show up so judge
+    // times share _handleNoteOn's real-beats timebase. Guarded to rebuild at
+    // most once per song; reset in scoreLoaded.
+    let _svJudgeRebuiltFromBeats = false;
 
     // ── Note-detection binding (this instance's chart-scoped context) ──
     let _svNdBindingId = null;
@@ -1742,6 +1749,7 @@ function createFactory() {
             if (_svInitToken !== myToken) return;
             _svAtBeats  = _svBuildBeatTimeline(score);
             _svLastBeat = null;
+            _svJudgeRebuiltFromBeats = false;
             _svBuildJudgeLists(score);
             const seq = _svNdLoadSeq;
             _svNdOpenBindingForChart(seq);
@@ -2323,6 +2331,22 @@ function createFactory() {
             if (!_isReady || !bundle) return;
 
             _svLatestBeats = bundle.beats || null;
+
+            // Judge times were built at scoreLoaded from the constant-BPM
+            // fallback (beats hadn't arrived). Rebuild once on the real beats
+            // stream so judge times match _handleNoteOn's timebase.
+            if (!_svJudgeRebuiltFromBeats
+                    && _svLatestBeats && _svLatestBeats.length >= 2
+                    && _svApi && _svApi.score && _svJudgeNotesAll) {
+                _svJudgeRebuiltFromBeats = true;
+                // Rebuild only changes judge times; noteKeys are tick/index-
+                // based and stable. _svBuildJudgeLists clears _svHitNoteKeys,
+                // so preserve already-counted hits to avoid double-scoring
+                // notes hit before the real beats landed.
+                const priorHits = new Set(_svHitNoteKeys);
+                _svBuildJudgeLists(_svApi.score);
+                for (const k of priorHits) _svHitNoteKeys.add(k);
+            }
 
             // Detect song/arrangement change → open a new WS.
             const songInfo = bundle.songInfo || {};
