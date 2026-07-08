@@ -247,7 +247,10 @@ function _svPitchLabel(note) {
         en  = ks < 0 ? _SV_NOTE_EN_F[tone]  : _SV_NOTE_EN_S[tone];
         sol = ks < 0 ? _SV_NOTE_SOL_F[tone] : _SV_NOTE_SOL_S[tone];
     }
-    return en + octave + ' / ' + sol + octave;
+    // note.octave is alphaTab's internal floor(midi/12); scientific-pitch
+    // notation puts middle C (MIDI 60) at C4, so the printed octave is -1.
+    const sci = octave - 1;
+    return en + sci + ' / ' + sol + sci;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
