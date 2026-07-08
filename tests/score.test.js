@@ -49,6 +49,7 @@ function runSeek(notes, hitKeys, missKeys, counters, newTime, wrongKeyMissTimes 
         const _svMissNotes = new Set(A.missKeys);
         const _svHitNoteKeys = new Set(A.hitKeys);
         const _svWrongKeyMissTimes = A.wrongKeyMissTimes.slice();
+        const _svClearOnSeek = true;   // default; miss-dot rollback is gated on it (#16)
         let _svMissSweepIdx = 0;
         let _svHits = A.c.hits, _svMisses = A.c.misses;
         let _svHitsRH = A.c.hitsRH, _svMissesRH = A.c.missesRH;
