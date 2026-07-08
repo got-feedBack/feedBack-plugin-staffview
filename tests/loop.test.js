@@ -32,14 +32,17 @@ function grab(re, label) {
 
 const parseDetailSrc = grab(/function _svParseLoopEventDetail\(detail\) \{[\s\S]*?\n\}/, '_svParseLoopEventDetail');
 const orderBeatsSrc   = grab(/function _svOrderBeats\(beatA, beatB\) \{[\s\S]*?\n\}/, '_svOrderBeats');
+const horizDragSrc    = grab(/function _svIsHorizontalDrag\(dx, dy\) \{[\s\S]*?\n\}/, '_svIsHorizontalDrag');
+const validSpanSrc    = grab(/function _svIsValidLoopSpan\(timeA, timeB\) \{[\s\S]*?\n\}/, '_svIsValidLoopSpan');
 
 function load() {
     return new Function(
-        '"use strict";' + parseDetailSrc + '\n' + orderBeatsSrc
-        + '\nreturn { _svParseLoopEventDetail, _svOrderBeats };'
+        '"use strict";' + parseDetailSrc + '\n' + orderBeatsSrc + '\n'
+        + horizDragSrc + '\n' + validSpanSrc
+        + '\nreturn { _svParseLoopEventDetail, _svOrderBeats, _svIsHorizontalDrag, _svIsValidLoopSpan };'
     )();
 }
-const { _svParseLoopEventDetail, _svOrderBeats } = load();
+const { _svParseLoopEventDetail, _svOrderBeats, _svIsHorizontalDrag, _svIsValidLoopSpan } = load();
 
 // ── _svOrderBeats ─────────────────────────────────────────────────────────
 
@@ -106,4 +109,39 @@ test('returns null when neither recognized shape is present', () => {
 
 test('returns null when loopA/loopB are present but not numbers', () => {
     assert.equal(_svParseLoopEventDetail({ loopA: '2', loopB: 6 }), null);
+});
+
+// ── _svIsValidLoopSpan (zero-length loop guard) ───────────────────────────
+
+test('_svIsValidLoopSpan rejects a same-beat / zero-length span', () => {
+    // A drag whose start and end resolve to the same time → no loop.
+    assert.equal(_svIsValidLoopSpan(3.5, 3.5), false);
+});
+
+test('_svIsValidLoopSpan rejects an inverted span (end before start)', () => {
+    assert.equal(_svIsValidLoopSpan(4, 2), false);
+});
+
+test('_svIsValidLoopSpan rejects unresolved (null) times', () => {
+    assert.equal(_svIsValidLoopSpan(null, 2), false);
+    assert.equal(_svIsValidLoopSpan(2, null), false);
+});
+
+test('_svIsValidLoopSpan accepts a real forward span', () => {
+    assert.equal(_svIsValidLoopSpan(1, 2.5), true);
+});
+
+// ── _svIsHorizontalDrag (mouse/touch loop-arm dominance gate) ─────────────
+
+test('_svIsHorizontalDrag does NOT arm on a mostly-vertical small move', () => {
+    // ~9px move that is mostly vertical (an imprecise click) → not a loop.
+    assert.equal(_svIsHorizontalDrag(3, -8), false);
+});
+
+test('_svIsHorizontalDrag arms on a horizontally-dominant drag', () => {
+    assert.equal(_svIsHorizontalDrag(20, 4), true);
+});
+
+test('_svIsHorizontalDrag treats a 45° diagonal as horizontal (matches touch disarm test)', () => {
+    assert.equal(_svIsHorizontalDrag(10, -10), true);
 });

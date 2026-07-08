@@ -114,6 +114,22 @@ function _svOrderBeats(beatA, beatB) {
     return tA <= tB ? [beatA, beatB] : [beatB, beatA];
 }
 
+// A drag delta past its dead zone arms a loop only when it is horizontally
+// dominant (a scrub across beats), not vertical (an imprecise click or a
+// scroll). Shared by the mouse and touch drag paths so both gate identically.
+// Diagonal (|dx| === |dy|) counts as horizontal, matching the touch path's
+// original `abs(dy) > abs(dx)` disarm test.
+function _svIsHorizontalDrag(dx, dy) {
+    return Math.abs(dx) >= Math.abs(dy);
+}
+
+// A loop whose start and end resolve to the same (or inverted) time is a
+// degenerate zero-length loop — never commit it; the caller treats it as a
+// no-op. Also rejects unresolved (non-number) times.
+function _svIsValidLoopSpan(timeA, timeB) {
+    return typeof timeA === 'number' && typeof timeB === 'number' && timeB > timeA;
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // alphaTab CDN loader
 // ═══════════════════════════════════════════════════════════════════════
@@ -802,6 +818,11 @@ function createFactory() {
                     const dx = ev.clientX - _svDragStartClientX;
                     const dy = ev.clientY - _svDragStartClientY;
                     if (Math.hypot(dx, dy) <= 8) return;
+                    // Horizontal-dominance gate (mirrors the touch path): a
+                    // mostly-vertical move is an imprecise click, not a loop.
+                    // Disarm so onUp seeks; keep _svDragBeat (unlike touch) so
+                    // that seek can still resolve the start beat.
+                    if (!_svIsHorizontalDrag(dx, dy)) { _svDragArmed = false; return; }
                     _svDragActive = true;
                 }
                 const bll = _svApi && _svApi.boundsLookup;
@@ -941,7 +962,7 @@ function createFactory() {
                 const dy = t.clientY - _svDragStartClientY;
                 if (Math.hypot(dx, dy) <= 14) return;
                 // Vertical intent → disarm and yield to native scroll.
-                if (Math.abs(dy) > Math.abs(dx)) {
+                if (!_svIsHorizontalDrag(dx, dy)) {
                     _svDragArmed = false;
                     _svDragBeat  = null;
                     return;
@@ -1312,7 +1333,9 @@ function createFactory() {
     async function _svApplyOggLoop(beatA, beatB) {
         const timeA = _svBeatToSeconds(beatA);
         const timeB = _svBeatToSeconds(beatB);
-        if (timeA === null || timeB === null) return;
+        // Reject unresolved times and degenerate zero-length loops (drag
+        // start and end on the same beat) — treat as a no-op, not a loop.
+        if (!_svIsValidLoopSpan(timeA, timeB)) return;
 
         // Capture the generation so a concurrent _svClearLoop (or a second,
         // faster drag) can invalidate this continuation.
