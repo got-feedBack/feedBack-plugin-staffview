@@ -41,7 +41,7 @@ alphaTab is loaded from the jsDelivr CDN at runtime — no local build step need
 
 Browser-free host-integration helpers have a `node:test` suite:
 
-```
+```sh
 npm test
 ```
 
