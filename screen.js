@@ -2477,6 +2477,9 @@ function createFactory() {
         volRange.min = '0';
         volRange.max = '100';
         volRange.className = 'sv-vol-range';
+        // Accessible name: icon-only range in the pill has no visible <label>.
+        volRange.title = 'Monitor synth volume';
+        volRange.setAttribute('aria-label', 'Monitor synth volume');
         volRange.value = String(Math.round(_svSynthVolume * 100));
         volRange.style.cssText = 'flex:1 1 auto;min-width:0;accent-color:#4080e0';
         volRange.addEventListener('input', () => {
@@ -3944,7 +3947,13 @@ function createFactory() {
         _svPrerollResuming = true;   // gate advance — no preroll on resume
         try {
             const audio = document.getElementById('audio');
-            if (audio && audio.paused) audio.play();
+            if (audio && audio.paused) {
+                // play() can reject (autoplay policy / decode) — the sync
+                // try/catch won't catch a promise rejection, which would leave
+                // _svPrerollResuming stuck true. Reset it on rejection.
+                const p = audio.play();
+                if (p && typeof p.catch === 'function') p.catch(() => { _svPrerollResuming = false; });
+            }
         } catch (_) {}
     }
 
@@ -4084,6 +4093,7 @@ function createFactory() {
         if (!audio || _svStudySeekHandler) return;
         _svStudySeekHandler = function () {
             if (!_svStudyMode) return;
+            if (!_svIsFocused) return;   // shared #audio: only the focused panel reacts
             const t = audio.currentTime || 0;
             _svStudyGateIdx = 0;
             while (_svStudyGateIdx < _svStudyGates.length - 1 &&
@@ -4415,8 +4425,11 @@ function createFactory() {
             // Study mode: preroll count-in on manual play, and gate-pause when
             // the OGG reaches the next required note.
             try {
+                // Shared #audio element is driven from every instance's draw()
+                // loop; in split-screen, gate on focus so panels don't fight
+                // over the one track.
                 const audio = document.getElementById('audio');
-                if (audio) {
+                if (audio && _svIsFocused) {
                     const nowPaused = audio.paused;
                     if (_svWasAudioPaused === null) {
                         _svWasAudioPaused = nowPaused;   // first observation only
@@ -4427,7 +4440,11 @@ function createFactory() {
                             audio.pause();
                             _svStudyStartCountdown(() => {
                                 _svPrerollResuming = true;
-                                try { audio.play(); } catch (_) {}
+                                // Same play()-rejection guard as _svStudyAdvance.
+                                try {
+                                    const p = audio.play();
+                                    if (p && typeof p.catch === 'function') p.catch(() => { _svPrerollResuming = false; });
+                                } catch (_) {}
                             });
                         }
                         _svPrerollResuming = false;
