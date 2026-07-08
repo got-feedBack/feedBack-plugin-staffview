@@ -41,12 +41,13 @@ const seekSrc = grab(/function _svHandleSeek\(newTime\) \{[\s\S]*?\n    \}/, '_s
 // entries { noteKey, t, hand }; `hitKeys` are the noteKeys claimed as hits, the
 // rest of the swept region being miss dots. Returns the post-seek counters.
 function runSeek(notes, hitKeys, missKeys, counters, newTime, wrongKeyMissTimes = []) {
-    const missEntryByKey = new Map(notes.map((n) => [n.noteKey, n]));
+    const entryByKey = new Map(notes.map((n) => [n.noteKey, n]));
+    // _svMissNotes is a Map<noteKey, entry>; seed each missed key to its entry.
+    const missSeed = missKeys.map((k) => [k, entryByKey.get(k)]);
     const harness = `"use strict";
         const HIT_TOLERANCE_S = 0.1;
         let _svJudgeNotesAll = A.notes;
-        const _svMissEntryByKey = A.missEntryByKey;
-        const _svMissNotes = new Set(A.missKeys);
+        const _svMissNotes = new Map(A.missSeed);
         const _svHitNoteKeys = new Set(A.hitKeys);
         const _svWrongKeyMissTimes = A.wrongKeyMissTimes.slice();
         const _svClearOnSeek = true;   // default; miss-dot rollback is gated on it (#16)
@@ -65,7 +66,7 @@ function runSeek(notes, hitKeys, missKeys, counters, newTime, wrongKeyMissTimes 
             missDots: _svMissNotes.size, hitClaims: _svHitNoteKeys.size,
             wrongKeyMisses: _svWrongKeyMissTimes.length,
         };`;
-    return new Function('A', harness)({ notes, missEntryByKey, hitKeys, missKeys, c: counters, newTime, wrongKeyMissTimes });
+    return new Function('A', harness)({ notes, missSeed, hitKeys, missKeys, c: counters, newTime, wrongKeyMissTimes });
 }
 
 // ── _svAccuracyPct ───────────────────────────────────────────────────────────
