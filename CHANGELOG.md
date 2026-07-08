@@ -74,6 +74,54 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   the device correctly connected and open throughout — only this plugin's
   own UI never learned about it. Moved the call to after `wrap` is
   actually appended to the live document.
+- **OGG loop drag-select** — clicking and dragging (mouse, ≥8px) or
+  touch-dragging (≥14px, disarming on a predominantly-vertical first
+  movement so vertical scroll still works) across the score sets a loop
+  region via the platform's native `setLoop()` API, with a green overlay
+  (start/end marker bars + a filled region, spanning multiple staff-system
+  rows when the loop crosses a line break) that tracks it. The overlay also
+  mirrors loops set through the platform's *own* native controls or a
+  restored saved loop (`playback:loop-set` / `loop:restart` listeners,
+  converting seconds → the nearest `AT` beat via `_svTimeToNearestBeat`,
+  the inverse of the existing click-to-seek `_svBeatToSeconds`), and hides
+  when the platform clears the loop (`playback:loop-cleared`) regardless of
+  who set it. A generation counter (`_svLoopGen`) guards the async
+  `setLoop()` round-trip against a stale response landing after the user
+  cleared or re-dragged the loop. Teardown/song-switch only clears a loop
+  *we* set (`_svOwnsOggLoop`) — a loop the user set through the platform's
+  own controls is left alone.
+  - Not ported from the legacy source: a pill-based `[A]`/`[B]`/`[✕]` button
+    row and a section-jump `<select>` existed at one point but were removed
+    there in favour of the platform's own native loop UI — this PR follows
+    that same decision rather than reintroducing them.
+  - `preventDefault()` on `touchend` after a drag suppresses the
+    synthesized mousedown/click the browser would otherwise generate,
+    so a drag gesture is never immediately followed by an accidental seek;
+    `user-select:none` + a `selectstart` guard on the score's inner mount
+    div prevent iOS's text-selection magnifier from firing mid-drag.
+
+- **Note explorer** — alt/option-click (desktop) or double-tap (touch) a
+  notehead to show a floating pitch tooltip instead of seeking; a plain
+  click always seeks as before (the two are mutually exclusive per-click,
+  gated on the alt key / tap-timing, not on beat content). One line per
+  note in the beat (chord support), format `En / Sol` (e.g. `C#4 / DO#4`).
+  Spelling honours `note.accidentalMode` (Force* values override) with a
+  key-signature fallback (positive/zero key signature = sharp spelling,
+  negative = flat), via `_svPitchLabel()` — a pure, unit-tested helper.
+  Tooltip auto-dismisses after 4s or on the next mousedown/tap anywhere.
+  Toggleable via a new NOTE EXPLORER pill section (default on, persisted
+  to `localStorage`); double-tap uses `touch-action:manipulation` on the
+  score's inner mount div to suppress the browser's native double-tap
+  zoom.
+  - **Known limitation (carried over from the original implementation):**
+    on touch, the *first* tap of a double-tap doesn't call
+    `preventDefault()` on its `touchend` (only the confirmed second tap
+    does), so the browser's synthesized `mousedown` for that first tap
+    still reaches the normal seek path — the marker briefly seeks to the
+    tap position before the second tap's tooltip appears on top. Avoiding
+    it cleanly would mean delaying every single-tap-to-seek on touch by
+    the ~300ms double-tap window, which is a worse tradeoff for the common
+    single-tap case. Left as a follow-up.
 
 - **Options pill: LAYOUT and ZOOM controls** — reintroduces the ♩ Staff View
   pill removed alongside alphaSynth playback, now carrying only non-playback
