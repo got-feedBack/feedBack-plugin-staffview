@@ -16,6 +16,8 @@
 //   - Options pill (v3 plugin-control slot / v2 #player-footer / splitscreen
 //     panel): LAYOUT (page/horizontal) and ZOOM controls, persisted to
 //     localStorage
+//   - Note explorer: alt+click (desktop) / double-tap (touch) a notehead
+//     shows a pitch tooltip instead of seeking; toggleable in the pill
 //
 // Module-scope singletons:
 //   - alphaTab CDN load promise (one <script> per page)
@@ -47,8 +49,18 @@ const TICK_DELTA_THRESHOLD = 30;
 const DUR_MAP = { 1: 1, 2: 2, 4: 4, 8: 8, 16: 16, 32: 32 };
 
 // localStorage keys for pill-controlled, session-persisted preferences.
-const _SV_STORE_LAYOUT = 'staffview_layout';
-const _SV_STORE_SCALE  = 'staffview_scale';
+const _SV_STORE_LAYOUT         = 'staffview_layout';
+const _SV_STORE_SCALE          = 'staffview_scale';
+const _SV_STORE_NOTE_EXPLORER  = 'staffview_note_explorer';
+
+// Pitch name lookup tables for _svPitchLabel(), keyed by MIDI pitch class
+// (note.tone, 0-11). Sharp spelling used when key signature >= 0 or
+// accidentalMode is ForceSharp; flat spelling when key signature < 0 or
+// accidentalMode is ForceFlat.
+const _SV_NOTE_EN_S  = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const _SV_NOTE_SOL_S = ['DO','DO#','RE','RE#','MI','FA','FA#','SOL','SOL#','LA','LA#','SI'];
+const _SV_NOTE_EN_F  = ['C','Db','D','Eb','E','F','Gb','G','Ab','A','Bb','B'];
+const _SV_NOTE_SOL_F = ['DO','REb','RE','MIb','MI','FA','SOLb','SOL','LAb','LA','SIb','SI'];
 
 // ═══════════════════════════════════════════════════════════════════════
 // Module-level singletons
@@ -197,6 +209,48 @@ function _clefValue(clefStr) {
 // The internal Automation class is not exported; a plain object works.
 function _makeTempoAutomation(bpm) {
     return { type: 0, isLinear: false, ratioPosition: 0, value: bpm, isVisible: true, text: '' };
+}
+
+// Returns an 'En / Sol' pitch label for a single alphaTab note, e.g.
+// 'C#4 / DO#4'. Respects note.accidentalMode (Force* values override
+// key-signature spelling); falls back to key-signature-derived sharp/flat
+// when accidentalMode is Default(0) or ForceNone(1): positive key
+// signature = sharp keys, negative = flat keys.
+// AccidentalMode enum (verified from AT 1.8.2 source): Default=0
+// ForceNone=1 ForceNatural=2 ForceSharp=3 ForceDoubleSharp=4 ForceFlat=5
+// ForceDoubleFlat=6.
+function _svPitchLabel(note) {
+    const tone   = note.tone;                        // 0-11
+    const octave = note.octave;
+    const am     = (note.accidentalMode != null) ? note.accidentalMode : 0;
+    let ks = 0;
+    try { ks = note.beat.voice.bar.masterBar.keySignature || 0; } catch (_) {}
+
+    let en, sol;
+    if (am === 3) {                                  // ForceSharp
+        en = _SV_NOTE_EN_S[tone]; sol = _SV_NOTE_SOL_S[tone];
+    } else if (am === 5) {                           // ForceFlat
+        en = _SV_NOTE_EN_F[tone]; sol = _SV_NOTE_SOL_F[tone];
+    } else if (am === 4) {                           // ForceDoubleSharp
+        const dsEn  = [null,'B##','C##',null,'D##',null,'E##','F##',null,'G##',null,'A##'];
+        const dsSol = [null,'SI##','DO##',null,'RE##',null,'MI##','FA##',null,'SOL##',null,'LA##'];
+        en  = dsEn[tone]  || _SV_NOTE_EN_S[tone]  + '(##)';
+        sol = dsSol[tone] || _SV_NOTE_SOL_S[tone] + '(##)';
+    } else if (am === 6) {                           // ForceDoubleFlat
+        const dfEn  = ['Dbb',null,'Ebb','Fbb',null,'Gbb',null,'Abb',null,'Bbb','Cbb',null];
+        const dfSol = ['REbb',null,'MIbb','FAbb',null,'SOLbb',null,'LAbb',null,'SIbb','DObb',null];
+        en  = dfEn[tone]  || _SV_NOTE_EN_F[tone]  + '(bb)';
+        sol = dfSol[tone] || _SV_NOTE_SOL_F[tone] + '(bb)';
+    } else if (am === 2) {                           // ForceNatural
+        en = _SV_NOTE_EN_S[tone] + '♮'; sol = _SV_NOTE_SOL_S[tone] + '♮';
+    } else {                                         // Default(0) / ForceNone(1)
+        en  = ks < 0 ? _SV_NOTE_EN_F[tone]  : _SV_NOTE_EN_S[tone];
+        sol = ks < 0 ? _SV_NOTE_SOL_F[tone] : _SV_NOTE_SOL_S[tone];
+    }
+    // note.octave is alphaTab's internal floor(midi/12); scientific-pitch
+    // notation puts middle C (MIDI 60) at C4, so the printed octave is -1.
+    const sci = octave - 1;
+    return en + sci + ' / ' + sol + sci;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -477,6 +531,22 @@ function createFactory() {
     let _svLastTick     = -1;
     let _svLatestBeats  = null; // bundle.beats snapshot
 
+    // ── Note explorer (alt-click / double-tap pitch tooltip) ────────
+    // _svNoteExplorerEnabled: pill checkbox, persisted, default on.
+    // _svTooltip: reused div, created lazily on first show.
+    // _svTooltipTimer/_svTooltipDismiss: auto-dismiss after 4s or on the
+    // next mousedown anywhere (capture-phase, one-shot).
+    let _svNoteExplorerEnabled = _svReadStore(_SV_STORE_NOTE_EXPLORER) !== 'false';
+    let _svTooltip        = null;
+    let _svTooltipTimer   = null;
+    let _svTooltipDismiss = null;
+
+    // ── Double-tap state (mobile note explorer — alt+click has no touch
+    // equivalent) ────────────────────────────────────────────────────
+    let _svLastTapTime  = 0;   // ms timestamp of the previous touchend
+    let _svLastTapX     = 0;   // canvas-space x of the previous tap
+    let _svLastTapY     = 0;   // canvas-space y of the previous tap
+
     // ── Layout mode and zoom (persisted, read once at factory creation) ────
     // Stored as plain values so instance creation doesn't touch alphaTab
     // (not loaded yet) — applied to the AlphaTabApi settings in _svInitAlphaTab.
@@ -561,6 +631,9 @@ function createFactory() {
         // rendering and skips entirely when it reads 0 — explicit width
         // keeps horizontal-layout loads from rendering blank.
         inner.style.width = '100%';
+        // Disables the browser's native double-tap zoom so the touchend
+        // handler below can use double-tap for the note explorer.
+        inner.style.touchAction = 'manipulation';
         c.appendChild(inner);
 
         // Playback marker — boundsLookup-driven (slopsmith#734 pattern).
@@ -586,10 +659,12 @@ function createFactory() {
         _svAtMount   = inner;
         _svMarker    = marker;
 
-        // ── Click-to-seek ─────────────────────────────────────────
+        // ── Click-to-seek / note explorer ───────────────────────────
         // mousedown on the score div: resolve the clicked position to a
-        // beat tick via boundsLookup.getBeatAtPos(), then seek the OGG
-        // audio element (currentTime) via the bundle.beats time stream.
+        // beat via boundsLookup.getBeatAtPos(). Alt+click shows the note
+        // explorer's pitch tooltip instead of seeking; a plain click always
+        // seeks the OGG audio element (currentTime) via the bundle.beats
+        // time stream.
         inner.addEventListener('mousedown', (e) => {
             if (!_svApi || !_svApiReady) return;
             const bl = _svApi.boundsLookup;
@@ -604,6 +679,15 @@ function createFactory() {
             let beat;
             try { beat = bl.getBeatAtPos(x, y); } catch (_) { return; }
             if (!beat) return;
+
+            // Alt+click → note explorer tooltip; suppresses seek for this
+            // click (no-op, falls through to nothing, if the beat is a rest).
+            if (e.altKey && _svNoteExplorerEnabled) {
+                if (beat.notes && beat.notes.length > 0) {
+                    _svShowNoteTooltip(beat, x, y);
+                }
+                return;
+            }
 
             const tick = typeof beat.absoluteDisplayStart === 'number'
                 ? beat.absoluteDisplayStart
@@ -621,6 +705,40 @@ function createFactory() {
             if (secs !== null) {
                 const audio = document.getElementById('audio');
                 if (audio) { try { audio.currentTime = secs; } catch (_) {} }
+            }
+        });
+
+        // Double-tap → note explorer (mobile equivalent of alt+click; touch
+        // devices have no alt key). touch-action:manipulation on inner
+        // (set above) already disables the browser's native double-tap
+        // zoom; preventDefault() here suppresses the synthesized mouse
+        // events that would otherwise follow the second tap.
+        inner.addEventListener('touchend', (e) => {
+            if (!_svNoteExplorerEnabled || !_svApi || !_svApiReady) return;
+            const t = e.changedTouches[0];
+            if (!t) return;
+            const rect = inner.getBoundingClientRect();
+            const x = t.clientX - rect.left + inner.scrollLeft;
+            const y = t.clientY - rect.top  + inner.scrollTop;
+            const now = Date.now();
+            const dt  = now - _svLastTapTime;
+            const dx  = x - _svLastTapX;
+            const dy  = y - _svLastTapY;
+            if (dt < 300 && Math.hypot(dx, dy) < 30) {
+                // Second tap within window — treat as double-tap.
+                e.preventDefault();
+                _svLastTapTime = 0; // reset so a triple-tap doesn't re-trigger
+                const bl = _svApi.boundsLookup;
+                if (!bl || typeof bl.getBeatAtPos !== 'function') return;
+                let beat;
+                try { beat = bl.getBeatAtPos(x, y); } catch (_) { return; }
+                if (beat && beat.notes && beat.notes.length > 0) {
+                    _svShowNoteTooltip(beat, x, y);
+                }
+            } else {
+                _svLastTapTime = now;
+                _svLastTapX    = x;
+                _svLastTapY    = y;
             }
         });
 
@@ -682,6 +800,80 @@ function createFactory() {
             _svAtMount   = null;
             _svMarker    = null;
         }
+    }
+
+    // ── Note explorer tooltip ────────────────────────────────────────
+
+    function _svTooltipDismissAll() {
+        if (_svTooltipTimer) { clearTimeout(_svTooltipTimer); _svTooltipTimer = null; }
+        if (_svTooltipDismiss) {
+            document.removeEventListener('mousedown', _svTooltipDismiss, { capture: true });
+            _svTooltipDismiss = null;
+        }
+        if (_svTooltip) { _svTooltip.style.display = 'none'; }
+    }
+
+    // Shows a floating pitch label near the click/tap position, clamped to
+    // the visible (scrolled) area of _svContainer. One line per note in the
+    // beat (chord support). Dismissed on the next mousedown anywhere or
+    // after 4s.
+    function _svShowNoteTooltip(beat, clickX, clickY) {
+        const lines = beat.notes.map(_svPitchLabel);
+        if (!lines.length) return;
+
+        if (!_svTooltip) {
+            const t = document.createElement('div');
+            t.className = 'sv-note-tooltip';
+            t.style.cssText = [
+                'position:absolute',
+                'padding:5px 10px',
+                'border-radius:8px',
+                'background:rgba(12,12,22,0.96)',
+                'border:1px solid rgba(255,255,255,0.12)',
+                'color:#e2e8f0',
+                'font-family:monospace',
+                'font-size:13px',
+                'line-height:1.6',
+                'white-space:pre',
+                'pointer-events:none',
+                'z-index:10',
+                'box-shadow:0 4px 12px rgba(0,0,0,0.4)',
+            ].join(';');
+            _svContainer.appendChild(t);
+            _svTooltip = t;
+        }
+
+        // Dismiss any previous tooltip/timer BEFORE showing the new one —
+        // doing this after `style.display = ''` would immediately hide the
+        // tooltip we just showed.
+        _svTooltipDismissAll();
+
+        _svTooltip.textContent = lines.join('\n');
+        _svTooltip.style.display = '';
+
+        // Position near the click, offset into container coordinates, then
+        // clamp to the currently-visible viewport of the scrollable container.
+        const tw  = _svTooltip.offsetWidth  || 120;
+        const th  = _svTooltip.offsetHeight || 40;
+        const cw  = _svContainer.clientWidth;
+        const ch  = _svContainer.clientHeight;
+        const sl  = _svContainer.scrollLeft;
+        const st  = _svContainer.scrollTop;
+        const ox  = (_svAtMount ? _svAtMount.offsetLeft : 0);
+        const oy  = (_svAtMount ? _svAtMount.offsetTop  : 0);
+        const GAP = 8;
+        let left = ox + clickX + GAP;
+        let top  = oy + clickY - Math.round(th / 2);
+        if (left + tw  > sl + cw - GAP) left = sl + cw - tw - GAP;
+        if (left       < sl + GAP)      left = sl + GAP;
+        if (top  + th  > st + ch - GAP) top  = st + ch - th - GAP;
+        if (top        < st + GAP)      top  = st + GAP;
+        _svTooltip.style.left = Math.round(left) + 'px';
+        _svTooltip.style.top  = Math.round(top)  + 'px';
+
+        _svTooltipTimer   = setTimeout(_svTooltipDismissAll, 4000);
+        _svTooltipDismiss = () => _svTooltipDismissAll();
+        document.addEventListener('mousedown', _svTooltipDismiss, { capture: true, once: true });
     }
 
     // ── Layout mode and zoom controls ───────────────────────────────
@@ -895,8 +1087,36 @@ function createFactory() {
             ? 'v3-pop-btn'
             : 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition';
 
+        // ── NOTE EXPLORER section ──────────────────────────────────
+        // Single checkbox for now. A future MIDI note-detection PR is
+        // expected to grow this into a full "Note Detection" section
+        // (Detect toggle, Clear-on-rewind) alongside this control.
+        const explorerSection = document.createElement('div');
+
+        const explorerRow = document.createElement('div');
+        explorerRow.className = 'section-practice-controls-row';
+        const explorerWrap = document.createElement('label');
+        explorerWrap.className = 'section-practice-mode-wrap';
+        const explorerCb = document.createElement('input');
+        explorerCb.type    = 'checkbox';
+        explorerCb.id      = 'sv-cb-note-explorer-' + _instanceId;
+        explorerCb.checked = _svNoteExplorerEnabled;
+        explorerCb.addEventListener('change', () => {
+            _svNoteExplorerEnabled = explorerCb.checked;
+            _svSaveStore(_SV_STORE_NOTE_EXPLORER, String(_svNoteExplorerEnabled));
+        });
+        const explorerText = document.createElement('span');
+        explorerText.className = 'section-practice-mode-text';
+        explorerText.textContent = 'Note explorer (alt+click / double-tap)';
+        explorerWrap.appendChild(explorerCb);
+        explorerWrap.appendChild(explorerText);
+        explorerRow.appendChild(explorerWrap);
+        explorerSection.appendChild(explorerRow);
+
         // ── LAYOUT section ────────────────────────────────────────
         const layoutSection = document.createElement('div');
+        layoutSection.style.cssText =
+            'margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px';
 
         const layoutLabel = document.createElement('span');
         layoutLabel.className = 'section-practice-label';
@@ -990,6 +1210,7 @@ function createFactory() {
         zoomSection.appendChild(zoomRow);
         zoomSection.appendChild(resetWrap);
 
+        popover.appendChild(explorerSection);
         popover.appendChild(layoutSection);
         popover.appendChild(zoomSection);
 
@@ -1546,6 +1767,9 @@ function createFactory() {
 
     function _svTeardown(restoreCanvas) {
         if (_svMarkerRefreshTimer) { clearInterval(_svMarkerRefreshTimer); _svMarkerRefreshTimer = null; }
+        _svTooltipDismissAll();
+        _svTooltip     = null;
+        _svLastTapTime = 0;
         _svApiReady      = false;
         _svLastTick      = -1;
         _svLastBeat      = null;

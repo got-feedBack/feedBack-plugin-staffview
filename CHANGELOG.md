@@ -10,6 +10,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Note explorer** — alt/option-click (desktop) or double-tap (touch) a
+  notehead to show a floating pitch tooltip instead of seeking; a plain
+  click always seeks as before (the two are mutually exclusive per-click,
+  gated on the alt key / tap-timing, not on beat content). One line per
+  note in the beat (chord support), format `En / Sol` (e.g. `C#4 / DO#4`).
+  Spelling honours `note.accidentalMode` (Force* values override) with a
+  key-signature fallback (positive/zero key signature = sharp spelling,
+  negative = flat), via `_svPitchLabel()` — a pure, unit-tested helper.
+  Tooltip auto-dismisses after 4s or on the next mousedown/tap anywhere.
+  Toggleable via a new NOTE EXPLORER pill section (default on, persisted
+  to `localStorage`); double-tap uses `touch-action:manipulation` on the
+  score's inner mount div to suppress the browser's native double-tap
+  zoom.
+  - **Known limitation (carried over from the original implementation):**
+    on touch, the *first* tap of a double-tap doesn't call
+    `preventDefault()` on its `touchend` (only the confirmed second tap
+    does), so the browser's synthesized `mousedown` for that first tap
+    still reaches the normal seek path — the marker briefly seeks to the
+    tap position before the second tap's tooltip appears on top. Avoiding
+    it cleanly would mean delaying every single-tap-to-seek on touch by
+    the ~300ms double-tap window, which is a worse tradeoff for the common
+    single-tap case. Left as a follow-up.
+
 - **Options pill: LAYOUT and ZOOM controls** — reintroduces the ♩ Staff View
   pill removed alongside alphaSynth playback, now carrying only non-playback
   formatting controls. Mounts into the v3 plugin-control slot
