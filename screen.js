@@ -3400,6 +3400,14 @@ function createFactory() {
             _svIsFocused = false;
             _svReleaseAllHeld();
             if (_svActiveInst === instance) _svActiveInst = null;   // eslint-disable-line no-use-before-define
+            // The study preroll/gate-pause block in draw() is gated on
+            // _svIsFocused, so this instance's _svWasAudioPaused freezes while
+            // unfocused. If the shared audio's play state actually changes
+            // meanwhile, the stale value can misread as a pause→play edge on
+            // refocus and fire a false preroll mid-playback. Null it so the
+            // first refocused frame just re-observes current state (same as
+            // the "first observation only" branch in draw()).
+            _svWasAudioPaused = null;
         }
     }
 
