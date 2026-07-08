@@ -1104,6 +1104,10 @@ function createFactory() {
     let _svHits = 0, _svMisses = 0, _svStreak = 0, _svBestStreak = 0;
     let _svHitsRH = 0, _svMissesRH = 0;   // hand 0 (top staff)
     let _svHitsLH = 0, _svMissesLH = 0;   // hand 1 (bottom staff)
+    // Wrong-key misses match no chart note, so they have no dot or judge entry
+    // to sweep on a backward seek — keep their times here to roll them out of
+    // the combined denominator too. (They never touch the per-hand tallies.)
+    const _svWrongKeyMissTimes = [];
     const _svHitNoteKeys = new Set();   // deduplicates per-note hit claims
 
     // ── LH/RH hand isolation ─────────────────────────────────────────
@@ -2551,14 +2555,17 @@ function createFactory() {
                     _svRedrawAllMissDots();
                 }
                 _svUpdateScoreBadge();
-                _svEmitNoteResult(true);
+                _svEmitNoteResult(true, n);
                 return n.noteKey;
             }
         }
         _svMisses++;
+        _svWrongKeyMissTimes.push(playedTime);
         _svStreak = 0;
         _svUpdateScoreBadge();
-        _svEmitNoteResult(false);
+        // Wrong-key press — no chart note matched; report the played time so
+        // core can still drop it on a backward-seek rebuild.
+        _svEmitNoteResult(false, { t: playedTime, midi: playedMidi });
         return null;
     }
 
@@ -2568,9 +2575,19 @@ function createFactory() {
     // what the (optional) feedBack-plugin-notedetect emits. Without this,
     // our note-detection domain reporting (PR4a) is invisible to core's
     // HUD/dashboard/song_stats — the two systems are otherwise unconnected.
-    function _svEmitNoteResult(hit) {
+    function _svEmitNoteResult(hit, note) {
         if (window.feedBack && typeof window.feedBack.emit === 'function') {
-            window.feedBack.emit(hit ? 'note:hit' : 'note:miss', {});
+            // Core's HUD keys off detail.noteTime to drop judgments at/after the
+            // seek position on a backward-seek rebuild — an empty payload can
+            // never be dropped, so replay would permanently double-count. Carry
+            // the note time (plus hand/midi where cheap, matching note_detect).
+            const detail = {};
+            if (note) {
+                if (note.t !== undefined)    detail.noteTime = note.t;
+                if (note.hand !== undefined) detail.hand = note.hand;
+                if (note.midi !== undefined) detail.midi = note.midi;
+            }
+            window.feedBack.emit(hit ? 'note:hit' : 'note:miss', detail);
         }
     }
 
@@ -2686,15 +2703,34 @@ function createFactory() {
     function _svHandleSeek(newTime) {
         if (!_svJudgeNotesAll) return;
         let changed = false;
+        // Un-score the rolled-back region: as each swept-miss dot and hit-claim
+        // for a note at/after newTime is cleared, decrement the matching tally
+        // (per-hand + combined) so a replay pass re-counts instead of inflating
+        // the denominator. Guard against negative on double-seek. hand 0 = RH.
         for (const key of _svMissNotes) {
             const entry = _svMissEntryByKey.get(key);
             if (entry && entry.t >= newTime) {
                 _svMissNotes.delete(key);
+                _svMisses = Math.max(0, _svMisses - 1);
+                if (entry.hand === 0) _svMissesRH = Math.max(0, _svMissesRH - 1);
+                else                  _svMissesLH = Math.max(0, _svMissesLH - 1);
                 changed = true;
             }
         }
         for (const e of _svJudgeNotesAll) {
-            if (e.t >= newTime) _svHitNoteKeys.delete(e.noteKey);
+            if (e.t >= newTime && _svHitNoteKeys.delete(e.noteKey)) {
+                _svHits = Math.max(0, _svHits - 1);
+                if (e.hand === 0) _svHitsRH = Math.max(0, _svHitsRH - 1);
+                else              _svHitsLH = Math.max(0, _svHitsLH - 1);
+            }
+        }
+        // Wrong-key misses have no dot/entry above; roll back the ones played
+        // at/after newTime (combined tally only — they carry no hand).
+        for (let i = _svWrongKeyMissTimes.length - 1; i >= 0; i--) {
+            if (_svWrongKeyMissTimes[i] >= newTime) {
+                _svWrongKeyMissTimes.splice(i, 1);
+                _svMisses = Math.max(0, _svMisses - 1);
+            }
         }
         _svMissSweepIdx = 0;
         while (_svMissSweepIdx < _svJudgeNotesAll.length &&
@@ -2702,6 +2738,7 @@ function createFactory() {
             _svMissSweepIdx++;
         }
         if (changed) _svRedrawAllMissDots();
+        _svUpdateScoreBadge();
     }
 
     // Monotonic sweep over the judge list as playback advances: any chart note
@@ -2738,7 +2775,7 @@ function createFactory() {
                 _svMisses++;
                 _svStreak = 0;
                 _svUpdateScoreBadge();
-                _svEmitNoteResult(false);
+                _svEmitNoteResult(false, n);
             }
         }
     }
@@ -2756,6 +2793,7 @@ function createFactory() {
         _svLastSweepTime = -1;
         _svHits = 0; _svMisses = 0; _svStreak = 0; _svBestStreak = 0;
         _svHitsRH = 0; _svMissesRH = 0; _svHitsLH = 0; _svMissesLH = 0;
+        _svWrongKeyMissTimes.length = 0;
         const now = _svGetCurrentTime();
         if (_svJudgeNotesAll && now && now > 0) {
             while (_svMissSweepIdx < _svJudgeNotesAll.length
