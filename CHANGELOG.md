@@ -10,6 +10,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **OGG loop drag-select** — clicking and dragging (mouse, ≥8px) or
+  touch-dragging (≥14px, disarming on a predominantly-vertical first
+  movement so vertical scroll still works) across the score sets a loop
+  region via the platform's native `setLoop()` API, with a green overlay
+  (start/end marker bars + a filled region, spanning multiple staff-system
+  rows when the loop crosses a line break) that tracks it. The overlay also
+  mirrors loops set through the platform's *own* native controls or a
+  restored saved loop (`playback:loop-set` / `loop:restart` listeners,
+  converting seconds → the nearest `AT` beat via `_svTimeToNearestBeat`,
+  the inverse of the existing click-to-seek `_svBeatToSeconds`), and hides
+  when the platform clears the loop (`playback:loop-cleared`) regardless of
+  who set it. A generation counter (`_svLoopGen`) guards the async
+  `setLoop()` round-trip against a stale response landing after the user
+  cleared or re-dragged the loop. Teardown/song-switch only clears a loop
+  *we* set (`_svOwnsOggLoop`) — a loop the user set through the platform's
+  own controls is left alone.
+  - Not ported from the legacy source: a pill-based `[A]`/`[B]`/`[✕]` button
+    row and a section-jump `<select>` existed at one point but were removed
+    there in favour of the platform's own native loop UI — this PR follows
+    that same decision rather than reintroducing them.
+  - `preventDefault()` on `touchend` after a drag suppresses the
+    synthesized mousedown/click the browser would otherwise generate,
+    so a drag gesture is never immediately followed by an accidental seek;
+    `user-select:none` + a `selectstart` guard on the score's inner mount
+    div prevent iOS's text-selection magnifier from firing mid-drag.
+
 - **Note explorer** — alt/option-click (desktop) or double-tap (touch) a
   notehead to show a floating pitch tooltip instead of seeking; a plain
   click always seeks as before (the two are mutually exclusive per-click,
