@@ -1,7 +1,7 @@
 {
   "id": "staffview",
   "name": "Staff View",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": false,
   "description": "Standard notation (grand staff) viewer for arrangements with sloppak notation data, rendered via alphaTab.",
   "type": "visualization",

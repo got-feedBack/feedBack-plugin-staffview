@@ -3396,6 +3396,13 @@ function createFactory() {
         if (shouldFocus && !_svIsFocused) {
             _svIsFocused  = true;
             _svActiveInst = instance;   // eslint-disable-line no-use-before-define
+            // A seek may have happened while unfocused (the study seeked
+            // handler ignores it then) — re-home the gate to the current
+            // position so it isn't stale on refocus.
+            if (_svStudyMode) {
+                const audio = document.getElementById('audio');
+                _svStudyRehomeGate((audio && audio.currentTime) || 0);
+            }
         } else if (!shouldFocus && _svIsFocused) {
             _svIsFocused = false;
             _svReleaseAllHeld();
@@ -4004,8 +4011,8 @@ function createFactory() {
 
     // MIDI note-on while study mode is active: judge it against the current
     // gate. Correct notes accumulate until the chord is complete (→ advance);
-    // wrong notes draw an X and count as a miss. Feeds the same core stats /
-    // note-detection channels as free-play judging.
+    // wrong notes draw an X. Study is unscored — it reports to the
+    // note-detection domain only, never to core's stats/HUD.
     // Register one physical note-on against a study gate. A single key press
     // clears EVERY charted note at that pitch: unison, octave-doubling and
     // both-hands same-beat collapse each yield multiple entries with equal
@@ -4120,6 +4127,21 @@ function createFactory() {
         }, beatMs);
     }
 
+    // Re-home the gate to time `t` and clear per-gate progress. Shared by the
+    // seeked handler, focus regain (a seek may have happened while unfocused,
+    // when the seeked handler ignores it) and study activation.
+    function _svStudyRehomeGate(t) {
+        _svStudyGateIdx = 0;
+        while (_svStudyGateIdx < _svStudyGates.length - 1 &&
+               _svStudyGates[_svStudyGateIdx].gateTime < t) {
+            _svStudyGateIdx++;
+        }
+        _svStudyChordHit.clear();
+        _svStudyWrongAttempts.clear();
+        _svRedrawAllMissDots();
+        _svStudySnapCursor();
+    }
+
     // A platform-initiated seek (scrub bar) while study is active: re-home the
     // gate to the seeked position and clear per-gate progress.
     function _svStudyAttachSeekHandler() {
@@ -4128,16 +4150,7 @@ function createFactory() {
         _svStudySeekHandler = function () {
             if (!_svStudyMode) return;
             if (!_svIsFocused) return;   // shared #audio: only the focused panel reacts
-            const t = audio.currentTime || 0;
-            _svStudyGateIdx = 0;
-            while (_svStudyGateIdx < _svStudyGates.length - 1 &&
-                   _svStudyGates[_svStudyGateIdx].gateTime < t) {
-                _svStudyGateIdx++;
-            }
-            _svStudyChordHit.clear();
-            _svStudyWrongAttempts.clear();
-            _svRedrawAllMissDots();
-            _svStudySnapCursor();
+            _svStudyRehomeGate(audio.currentTime || 0);
         };
         audio.addEventListener('seeked', _svStudySeekHandler);
     }
@@ -4157,14 +4170,8 @@ function createFactory() {
         _svStudyChordHit.clear();
         // Build the gate list and home to the current position — do NOT touch OGG.
         _svStudyBuildGates();
-        const t = _svGetCurrentTime() || 0;
-        _svStudyGateIdx = 0;
-        while (_svStudyGateIdx < _svStudyGates.length - 1 &&
-               _svStudyGates[_svStudyGateIdx].gateTime < t) {
-            _svStudyGateIdx++;
-        }
+        _svStudyRehomeGate(_svGetCurrentTime() || 0);
         _svStudyAttachSeekHandler();
-        _svStudySnapCursor();
         _svSetStudyActive(instance, true);   // hide core's live HUD in study
         _svUpdateStudyBtn();
     }

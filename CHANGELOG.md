@@ -6,7 +6,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased]
+## [0.3.0] — 2026-07-08
 
 ### Added
 
@@ -34,8 +34,8 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     Platform/click seeks re-home the gate to the seeked position.
   - Optional **preroll count-in** (one bar of metronome clicks, persisted) when
     playback resumes; its `AudioContext` is closed on teardown.
-  - Judged notes flow through the same core note-detection / stats channels as
-    free-play (`note:hit` / `note:miss`, `reportHit` / `reportMiss`).
+  - Study is unscored practice: notes report to the core note-detection domain
+    (`reportHit` / `reportMiss`) for observability only — see Fixed below.
 
 - **Score-surface feedback** — visual and statistical feedback layered onto
   the notation as you play.
