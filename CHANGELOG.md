@@ -10,6 +10,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Monitor synth — hear your MIDI keyboard** — a WebAudioFont-based synth
+  plays back what you play on the connected MIDI keyboard, since core has
+  no keyboard-tone synth of its own (keyboard tones are new ground in the
+  project). Loads [WebAudioFont](https://github.com/surikov/webaudiofont)
+  from its own CDN (`surikov.github.io`) as a **second third-party runtime
+  dependency** alongside alphaTab — flagged here explicitly as a candidate
+  for future core-hosted keyboard tones rather than a permanent external
+  dependency.
+  - 10 General MIDI instrument presets (Grand Piano, Electric Piano,
+    Honky-tonk, Organ, Strings, Synth Lead, Synth Pad, Harpsichord,
+    Vibraphone, Music Box), switchable via a **Sound** select in the pill's
+    MIDI section; a **Volume** range slider alongside it. Both persisted to
+    `localStorage`.
+  - Lazily initialized on the *first* note-on (not eagerly) — avoids an
+    unprompted `AudioContext` (browser autoplay policy blocks that anyway)
+    and any upfront cost for a keyboard that's never played.
+  - Registers a **Keyboard** fader in the platform mixer
+    (`window.feedBack.audio.registerFader`, feedBack#87), bidirectionally
+    synced with the pill's own volume slider.
+  - Sustain pedal (CC64) held via explicit envelope `cancel()` rather than
+    WebAudioFont's own decay — a note keeps sounding until its matching
+    note-off (or a sustain release) explicitly cuts it.
+  - `_svWafFile`/`_svWafVar`/`_svWafUrl` (GM program number → data-file
+    name / global preset variable / CDN URL) extracted as pure,
+    unit-tested module-level helpers.
+
 - **MIDI input + note-detection scoring** — connects a MIDI keyboard and
   judges played notes against the loaded score (±100ms tolerance).
   - Device connection goes through the core `midi-input` capability domain

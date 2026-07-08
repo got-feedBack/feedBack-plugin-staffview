@@ -22,6 +22,8 @@
 //     and reported through the core note-detection domain (register-
 //     provider once, open-binding per chart, reportHit/reportMiss) —
 //     staffview owns judgment, the domain only carries the result.
+//   - Monitor synth (WebAudioFont, own CDN) plays back the connected MIDI
+//     keyboard; a mixer fader and pill Sound/Volume controls tune it
 //   - Note explorer: alt+click (desktop) / double-tap (touch) a notehead
 //     shows a pitch tooltip instead of seeking; toggleable in the pill
 //   - OGG loop: click-drag (or touch-drag) across the score sets a loop
@@ -86,6 +88,9 @@ const _SV_NOTE_EN_S  = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 const _SV_NOTE_SOL_S = ['DO','DO#','RE','RE#','MI','FA','FA#','SOL','SOL#','LA','LA#','SI'];
 const _SV_NOTE_EN_F  = ['C','Db','D','Eb','E','F','Gb','G','Ab','A','Bb','B'];
 const _SV_NOTE_SOL_F = ['DO','REb','RE','MIb','MI','FA','SOLb','SOL','LAb','LA','SIb','SI'];
+
+const _SV_STORE_SYNTH_INST = 'staffview_synth_inst';
+const _SV_STORE_SYNTH_VOL  = 'staffview_synth_vol';
 
 // ═══════════════════════════════════════════════════════════════════════
 // Module-level singletons
@@ -440,6 +445,187 @@ function _svNdReport(hit, midi, bindingId) {
         };
         if (hit) nd.reportHit(payload); else nd.reportMiss(payload);
     } catch (_) {}
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// WebAudioFont monitor synth (module-level — one AudioContext per tab)
+// ═══════════════════════════════════════════════════════════════════════
+// Lets you hear the MIDI keyboard while playing along with the notation —
+// core has no keyboard-tone synth of its own, so this loads WebAudioFont
+// from its own CDN (surikov.github.io) as a second third-party runtime
+// dependency alongside alphaTab. Flagged in the PR body as a candidate for
+// future core-hosted keyboard tones.
+
+const WAF_BASE       = 'https://surikov.github.io/webaudiofontdata/sound/';
+const WAF_PLAYER_URL = 'https://surikov.github.io/webaudiofont/npm/dist/WebAudioFontPlayer.js';
+const WAF_SF         = 'JCLive_sf2_file';
+
+const _SV_INSTRUMENTS = [
+    { name: 'Grand Piano',    gm: 0  },
+    { name: 'Electric Piano', gm: 4  },
+    { name: 'Honky-tonk',     gm: 3  },
+    { name: 'Organ',          gm: 19 },
+    { name: 'Strings',        gm: 48 },
+    { name: 'Synth Lead',     gm: 80 },
+    { name: 'Synth Pad',      gm: 88 },
+    { name: 'Harpsichord',    gm: 6  },
+    { name: 'Vibraphone',     gm: 11 },
+    { name: 'Music Box',      gm: 10 },
+];
+
+// Pure — the WebAudioFont data-file naming convention (GM program number
+// zero-padded *10, one <script> per instrument, each defining a global
+// `_tone_<file>` preset variable).
+function _svWafFile(gm) { return String(gm * 10).padStart(4, '0') + '_' + WAF_SF; }
+function _svWafVar(gm)  { return '_tone_' + _svWafFile(gm); }
+function _svWafUrl(gm)  { return WAF_BASE + _svWafFile(gm) + '.js'; }
+
+function _svLoadWafScript(url) {
+    return new Promise((resolve, reject) => {
+        if (document.querySelector(`script[src="${url}"]`)) { resolve(); return; }
+        const s = document.createElement('script');
+        s.src = url;
+        s.onload  = resolve;
+        s.onerror = () => reject(new Error('[staffview] Failed to load ' + url));
+        document.head.appendChild(s);
+    });
+}
+
+let _svAudioCtx        = null;
+let _svSynthGain       = null;
+let _svSynthPlayer     = null;
+let _svSynthPreset     = null;
+let _svSynthInitPromise = null;   // in-flight _svSynthInit() promise (race guard)
+let _svWafScriptLoaded = false;
+const _svNoteEnvelopes = new Map();   // midi → WebAudioFont envelope handle
+let _svSynthVolume        = parseFloat(_svReadStore(_SV_STORE_SYNTH_VOL) || '0.7');
+let _svSynthInstrumentIdx = parseInt(_svReadStore(_SV_STORE_SYNTH_INST) || '0', 10);
+
+// Lazily loads the WebAudioFontPlayer script + the saved instrument's sound
+// data, then builds the AudioContext/gain/player chain. Safe to call
+// repeatedly (no-op once _svSynthPlayer exists) — called from the first
+// note-on so there's no unprompted AudioContext creation (autoplay policy)
+// and no upfront cost for keyboards that are never played.
+function _svSynthInit() {
+    if (_svSynthPlayer) return Promise.resolve();
+    // Memoize the in-flight promise so a chord (N near-simultaneous note-ons,
+    // each fire-and-forget calling _svSynthInit) runs the body ONCE instead of
+    // racing N AudioContexts past the null-player guard and orphaning all but
+    // the last (browsers cap ~6 live contexts).
+    if (_svSynthInitPromise) return _svSynthInitPromise;
+    _svSynthInitPromise = (async () => {
+        try {
+            if (!_svWafScriptLoaded) {
+                await _svLoadWafScript(WAF_PLAYER_URL);
+                _svWafScriptLoaded = true;
+            }
+            if (typeof WebAudioFontPlayer === 'undefined') return;
+            _svAudioCtx  = new (window.AudioContext || window.webkitAudioContext)();
+            _svSynthGain = _svAudioCtx.createGain();
+            _svSynthGain.gain.value = _svSynthVolume;
+            _svSynthGain.connect(_svAudioCtx.destination);
+            _svSynthPlayer = new WebAudioFontPlayer();
+            await _svSynthLoadInstrument(_svSynthInstrumentIdx);
+        } catch (e) {
+            console.warn('[staffview] Synth init failed:', e);
+        } finally {
+            // If the player never came up, clear the memo so a later note-on
+            // retries instead of latching onto a dead promise forever.
+            if (!_svSynthPlayer) _svSynthInitPromise = null;
+        }
+    })();
+    return _svSynthInitPromise;
+}
+
+async function _svSynthLoadInstrument(idx) {
+    const inst = _SV_INSTRUMENTS[idx];
+    if (!inst || !_svSynthPlayer || !_svAudioCtx) return;
+    const varName = _svWafVar(inst.gm);
+    try {
+        if (!window[varName]) await _svLoadWafScript(_svWafUrl(inst.gm));
+        const preset = window[varName];
+        if (preset) {
+            _svSynthPlayer.adjustPreset(_svAudioCtx, preset);
+            _svSynthPreset = preset;
+        }
+    } catch (e) {
+        console.warn('[staffview] Failed to load instrument:', inst.name, e);
+    }
+}
+
+// Browsers suspend a newly-created AudioContext until a user gesture; the
+// MIDI note-on that triggers _svSynthInit() in the first place IS that
+// gesture, so resume it every note-on (cheap no-op once running).
+function _svSynthEnsureCtx() {
+    if (_svAudioCtx && _svAudioCtx.state === 'suspended') _svAudioCtx.resume();
+}
+
+// Maps a MIDI velocity (0–127) to a WebAudioFont per-note gain (0–1);
+// undefined velocity → full (1). Master volume is applied once by _svSynthGain,
+// so the per-note value must be velocity — NOT _svSynthVolume, which would
+// square the loudness (vol²) and drop dynamics entirely.
+function _svVelocityGain(velocity) {
+    if (velocity == null) return 1;
+    return Math.max(0, Math.min(1, velocity / 127));
+}
+
+function _svSynthNoteOn(midi, velocity) {
+    if (!_svSynthPlayer || !_svSynthPreset || !_svAudioCtx || !_svSynthGain) return;
+    _svSynthEnsureCtx();
+    const existing = _svNoteEnvelopes.get(midi);
+    if (existing) { try { existing.cancel(); } catch (_) {} }
+    try {
+        // Duration 999s (effectively "until noteOff") — sustain is driven
+        // by explicit cancel(), not the WebAudioFont library's own envelope.
+        const envelope = _svSynthPlayer.queueWaveTable(
+            _svAudioCtx, _svSynthGain, _svSynthPreset, 0, midi, 999, _svVelocityGain(velocity)
+        );
+        _svNoteEnvelopes.set(midi, envelope);
+    } catch (_) {}
+}
+
+function _svSynthNoteOff(midi) {
+    const env = _svNoteEnvelopes.get(midi);
+    if (env) {
+        try { env.cancel(); } catch (_) {}
+        _svNoteEnvelopes.delete(midi);
+    }
+}
+
+function _svSynthReleaseAll() {
+    for (const env of _svNoteEnvelopes.values()) {
+        try { env.cancel(); } catch (_) {}
+    }
+    _svNoteEnvelopes.clear();
+}
+
+// ── Mixer fader (feedBack#87) ────────────────────────────────────────────
+
+function _svRegisterFader() {
+    const api = window.feedBack && window.feedBack.audio;
+    if (!api || typeof api.registerFader !== 'function') return;
+    api.registerFader({
+        id:    'staffview_keyboard',
+        label: 'Keyboard',
+        min: 0, max: 1, step: 0.01,
+        defaultValue: 0.7,
+        getValue: () => _svSynthVolume,
+        setValue: (v) => {
+            _svSynthVolume = v;
+            _svSaveStore(_SV_STORE_SYNTH_VOL, String(v));
+            if (_svSynthGain) _svSynthGain.gain.value = v;
+            // Keep every mounted pill's own volume slider in sync when the
+            // value changes from the mixer side.
+            document.querySelectorAll('.sv-vol-range').forEach(r => {
+                r.value = String(Math.round(v * 100));
+            });
+        },
+    });
+}
+if (window.feedBack && window.feedBack.audio) {
+    _svRegisterFader();
+} else {
+    window.addEventListener('feedBack:audio:ready', _svRegisterFader, { once: true });
 }
 
 // Zoom clamp: 50%-200% in 5% steps. Pulled out of _svSetScale so the pure
@@ -2075,6 +2261,64 @@ function createFactory() {
         midiSection.appendChild(midiLabel);
         midiSection.appendChild(midiRow);
 
+        // ── Monitor synth — Sound + Volume rows ─────────────────────
+        // Grouped visually inside the MIDI section since they only matter
+        // once a MIDI device is connected.
+        const soundRow = document.createElement('div');
+        soundRow.className = 'section-practice-controls-row';
+        soundRow.style.marginTop = '6px';
+
+        const soundLabel = document.createElement('span');
+        soundLabel.className = 'section-practice-label';
+        soundLabel.textContent = 'Sound';
+        soundLabel.style.cssText = 'margin-right:4px;font-size:10px;opacity:0.7;white-space:nowrap';
+
+        const soundSel = document.createElement('select');
+        soundSel.className = selCls;
+        soundSel.title = 'Monitor synth instrument';
+        _SV_INSTRUMENTS.forEach((inst, i) => {
+            const o = document.createElement('option');
+            o.value = String(i); o.textContent = inst.name;
+            if (i === _svSynthInstrumentIdx) o.selected = true;
+            soundSel.appendChild(o);
+        });
+        soundSel.addEventListener('change', () => {
+            const idx = parseInt(soundSel.value, 10);
+            _svSynthInstrumentIdx = idx;
+            _svSaveStore(_SV_STORE_SYNTH_INST, String(idx));
+            _svSynthLoadInstrument(idx);
+        });
+
+        soundRow.appendChild(soundLabel);
+        soundRow.appendChild(soundSel);
+        midiSection.appendChild(soundRow);
+
+        const volRow = document.createElement('div');
+        volRow.className = 'section-practice-controls-row';
+        volRow.style.cssText = 'margin-top:6px;align-items:center;gap:6px';
+
+        const volLabel = document.createElement('span');
+        volLabel.className = 'section-practice-label';
+        volLabel.textContent = 'Volume';
+        volLabel.style.cssText = 'font-size:10px;opacity:0.7;white-space:nowrap';
+
+        const volRange = document.createElement('input');
+        volRange.type = 'range';
+        volRange.min = '0';
+        volRange.max = '100';
+        volRange.className = 'sv-vol-range';
+        volRange.value = String(Math.round(_svSynthVolume * 100));
+        volRange.style.cssText = 'flex:1 1 auto;min-width:0;accent-color:#4080e0';
+        volRange.addEventListener('input', () => {
+            const v = parseInt(volRange.value, 10) / 100;
+            _svSynthVolume = v;
+            _svSaveStore(_SV_STORE_SYNTH_VOL, String(v));
+            if (_svSynthGain) _svSynthGain.gain.value = v;
+        });
+
+        volRow.appendChild(volLabel);
+        volRow.appendChild(volRange);
+        midiSection.appendChild(volRow);
         // ── NOTE EXPLORER section ──────────────────────────────────
         // Single checkbox for now. A future MIDI note-detection PR is
         // expected to grow this into a full "Note Detection" section
@@ -2828,14 +3072,20 @@ function createFactory() {
         }
     }
 
-    // No-op until the monitor synth PR adds actual audio to release — kept
-    // as a real function (not deleted) since it's part of the fixed MIDI
-    // handler interface _svMidiConnect/_svUpdateFocusState call by name.
     function _svReleaseAllHeld() {
+        _svSynthReleaseAll();
         _svHeldNotes.clear();
         _svSustainedNotes.clear();
         _svSustainOn = false;
     }
+
+    // Thin wrappers so _handleNoteOn/_handleNoteOff read as "judge + sound"
+    // rather than reaching into the module-level synth directly.
+    function _svMonitorNoteOn(midi, velocity) {
+        _svSynthInit();   // no-op once already initialised
+        _svSynthNoteOn(midi, velocity);
+    }
+    function _svMonitorNoteOff(midi) { _svSynthNoteOff(midi); }
 
     function _svGetCurrentTime() {
         try {
@@ -2935,6 +3185,7 @@ function createFactory() {
     function _handleNoteOn(midi, velocity) {
         if (midi < 0 || midi > 127) return;
         _svHeldNotes.set(midi, velocity);
+        _svMonitorNoteOn(midi, velocity);
         const t = _svGetCurrentTime();
         if (t !== null) {
             const hitKey = _svJudgeHit(midi, t);
@@ -2946,6 +3197,7 @@ function createFactory() {
         if (midi < 0 || midi > 127) return;
         if (_svSustainOn) { _svSustainedNotes.add(midi); return; }
         _svHeldNotes.delete(midi);
+        _svMonitorNoteOff(midi);
     }
 
     function _handleSustain(down) {
@@ -2953,7 +3205,10 @@ function createFactory() {
             _svSustainOn = true;
         } else {
             _svSustainOn = false;
-            for (const midi of _svSustainedNotes) _svHeldNotes.delete(midi);
+            for (const midi of _svSustainedNotes) {
+                _svHeldNotes.delete(midi);
+                _svMonitorNoteOff(midi);
+            }
             _svSustainedNotes.clear();
         }
     }
