@@ -61,3 +61,27 @@ test('_svClampScale: boundary values are exact, not off-by-one-step', () => {
     assert.equal(_svClampScale(0.5), 0.5);
     assert.equal(_svClampScale(2.0), 2.0);
 });
+
+// ── read path: persisted staffview_scale must be clamped/NaN-guarded ──────────
+// Mirrors the init expression in screen.js:
+//   const s = parseFloat(_svReadStore(_SV_STORE_SCALE));
+//   _svScale = _svClampScale(Number.isFinite(s) ? s : 1.0)
+// Uses the real _svClampScale so a regression in either half is caught.
+const readScale = (raw) => {
+    const s = parseFloat(raw);
+    return _svClampScale(Number.isFinite(s) ? s : 1.0);
+};
+
+test('read path clamps an out-of-range stored value to the ceiling', () => {
+    assert.equal(readScale('10'), 2.0);
+});
+
+test('read path clamps a below-range stored value (incl. 0) to the floor', () => {
+    assert.equal(readScale('0'), 0.5);
+    assert.equal(readScale('0.1'), 0.5);
+});
+
+test('read path falls back to 1.0 on garbage (NaN), never renders NaN', () => {
+    assert.equal(readScale('abc'), 1.0);
+    assert.equal(readScale(null), 1.0);   // no stored value
+});

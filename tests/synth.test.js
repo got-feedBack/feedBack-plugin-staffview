@@ -28,14 +28,16 @@ const wafSf   = grab(/^const WAF_SF\s*=.*$/m, 'WAF_SF');
 const fileSrc = grab(/function _svWafFile\(gm\) \{[\s\S]*?\}/, '_svWafFile');
 const varSrc  = grab(/function _svWafVar\(gm\)\s*\{[\s\S]*?\}/, '_svWafVar');
 const urlSrc  = grab(/function _svWafUrl\(gm\)\s*\{[\s\S]*?\}/, '_svWafUrl');
+const velSrc  = grab(/function _svVelocityGain\(velocity\)\s*\{[\s\S]*?\n\}/, '_svVelocityGain');
 
 function load() {
     return new Function(
         '"use strict";' + wafBase + '\n' + wafSf + '\n' + fileSrc + '\n' + varSrc + '\n' + urlSrc
-        + '\nreturn { _svWafFile, _svWafVar, _svWafUrl };'
+        + '\n' + velSrc
+        + '\nreturn { _svWafFile, _svWafVar, _svWafUrl, _svVelocityGain };'
     )();
 }
-const { _svWafFile, _svWafVar, _svWafUrl } = load();
+const { _svWafFile, _svWafVar, _svWafUrl, _svVelocityGain } = load();
 
 // ── _svWafFile ────────────────────────────────────────────────────────────
 
@@ -72,4 +74,26 @@ test('_svWafVar and _svWafUrl agree on the same file name for a given GM program
     const file = _svWafFile(gm);
     assert.ok(_svWafVar(gm).endsWith(file));
     assert.ok(_svWafUrl(gm).endsWith(file + '.js'));
+});
+
+// ── _svVelocityGain ───────────────────────────────────────────────────────
+// The per-note gain must be velocity/127, NOT _svSynthVolume — the master
+// gain node already applies _svSynthVolume, so reusing it here would square
+// loudness (vol²) and discard MIDI dynamics.
+
+test('_svVelocityGain maps a MIDI velocity to velocity/127', () => {
+    assert.equal(_svVelocityGain(64), 64 / 127);
+    assert.equal(_svVelocityGain(127), 1);
+    assert.equal(_svVelocityGain(0), 0);
+});
+
+test('_svVelocityGain falls back to full gain when velocity is undefined', () => {
+    assert.equal(_svVelocityGain(undefined), 1);
+});
+
+test('_svVelocityGain never references _svSynthVolume (would square master volume)', () => {
+    // Guard against a regression to queueWaveTable(..., _svSynthVolume): the
+    // helper is deliberately independent of the master volume.
+    assert.ok(!velSrc.includes('_svSynthVolume'),
+        '_svVelocityGain must not read _svSynthVolume');
 });
