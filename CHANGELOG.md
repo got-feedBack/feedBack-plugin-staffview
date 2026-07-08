@@ -311,6 +311,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   HUD/controls heights when those elements are `position:absolute` overlays
   in v3 (`window.slopsmith.uiVersion === 'v3'`).
 
+### Fixed
+
+- **Study mode is now unscored practice** — a gate only advances once played
+  correctly, so a run is always ~100% by construction. Study no longer
+  mutates the free-play tallies (`_svHits`/`_svMisses`/per-hand), claims
+  notes in the sweep sets, or emits `note:hit`/`note:miss` — it only advances
+  the gate and reports to the note-detection domain (observability). Fixes a
+  real bug this uncovered: the free-play time-sweep (and its backward-seek
+  rollback) was still running under study's own gate accounting, corrupting
+  the tally on a study seek-back. Core's live HUD is now hidden while study
+  is active instead of showing a meaningless (or corrupted) accuracy.
+- **Study audio focus-gated in split-screen** — the preroll/gate-pause loop
+  and the `seeked` handler now run only for the focused instance, so two
+  Study panels no longer fight over the shared `#audio` element. Also resets
+  the pause/play edge tracker on focus loss, so a stale read on refocus can't
+  fire a false preroll mid-playback.
+- **Guarded `audio.play()` promise rejection** in study resume/preroll so a
+  rejected play (autoplay policy, decode error) can't leave playback stuck
+  with the preroll-resuming flag pinned true.
+- **Volume slider accessible name** — added `aria-label`/`title` so screen
+  readers don't announce it as an unlabeled slider.
+
 ---
 
 ## [0.2.0] — 2026-06-11
