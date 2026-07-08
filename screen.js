@@ -720,6 +720,57 @@ function _loadAlphaTab() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Core live-performance HUD repositioning (v3)
+// ═══════════════════════════════════════════════════════════════════════
+// Core's #v3-live-performance-hud lives in the top bar (#player-hud) — the
+// right spot for falling-note vizs, but it overlaps the grand staff here.
+// While a staffview view is actually showing notation we move it to the
+// bottom-right, stacked just above our own per-hand score badge. The scope
+// is driven by a class the plugin toggles on its own show/teardown triggers
+// (NOT a CSS-only heuristic), so it can never affect other vizs; the move
+// itself is one injected CSS rule. HUD only exists in v3, so v2/SS no-op.
+const _svNotationShowing  = new Set();   // instances currently showing notation
+let   _svHudStyleInjected = false;
+
+function _svEnsureHudStyle() {
+    if (_svHudStyleInjected) return;
+    _svHudStyleInjected = true;
+    const s = document.createElement('style');
+    s.id = 'staffview-hud-reposition';
+    // Our per-hand line lives inside this box (see _svHandAccEl), so the whole
+    // scoreboard moves as one unit — just anchor it to the bottom-right, clear
+    // of the grand staff and above the player controls.
+    s.textContent =
+        'html.staffview-notation-active #v3-live-performance-hud{' +
+        'position:fixed;top:auto;bottom:96px;right:16px;left:auto;z-index:30;}';
+    document.head.appendChild(s);
+}
+
+// Remove our injected per-hand line from core's HUD so it never lingers
+// under another viz's HUD once staffview stops showing notation.
+function _svRemoveHandAcc() {
+    const el = document.getElementById('staffview-hand-acc');
+    if (el && el.parentElement) el.parentElement.removeChild(el);
+}
+
+function _svSetNotationShowing(instance, on) {
+    if (on) {
+        if (!_isV3()) return;   // core HUD only exists in v3
+        _svNotationShowing.add(instance);
+    } else {
+        _svNotationShowing.delete(instance);
+    }
+    const cls = document.documentElement.classList;
+    if (_svNotationShowing.size > 0) {
+        _svEnsureHudStyle();
+        cls.add('staffview-notation-active');
+    } else {
+        cls.remove('staffview-notation-active');
+        _svRemoveHandAcc();   // clean up our injected HUD line
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Filename tracking (module-level — one global player)
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1175,6 +1226,12 @@ function createFactory() {
     let _svJudgeNotesRH  = null;   // hand=0 (top staff) subset
     let _svJudgeNotesLH  = null;   // hand=1 (bottom staff) subset
     let _svHits = 0, _svMisses = 0, _svStreak = 0, _svBestStreak = 0;
+    let _svHitsRH = 0, _svMissesRH = 0;   // hand 0 (top staff)
+    let _svHitsLH = 0, _svMissesLH = 0;   // hand 1 (bottom staff)
+    // Wrong-key misses match no chart note, so they have no dot or judge entry
+    // to sweep on a backward seek — keep their times here to roll them out of
+    // the combined denominator too. (They never touch the per-hand tallies.)
+    const _svWrongKeyMissTimes = [];
     const _svHitNoteKeys = new Set();   // deduplicates per-note hit claims
     // scoreLoaded usually fires before the bundle.beats stream arrives, so
     // the initial judge times come from _svBeatToSeconds's crude constant-BPM
@@ -1182,6 +1239,25 @@ function createFactory() {
     // times share _handleNoteOn's real-beats timebase. Guarded to rebuild at
     // most once per song; reset in scoreLoaded.
     let _svJudgeRebuiltFromBeats = false;
+
+    // ── LH/RH hand isolation ─────────────────────────────────────────
+    let _svActiveHands = 'both';   // 'both' | 'rh' | 'lh'
+    let _svHandRow      = null;
+    let _svRhBtn        = null;
+    let _svLhBtn        = null;
+
+    // ── Miss-dot overlay ───────────────────────────────────────────
+    // A persistent canvas (below the playback marker's z-index) sweeps
+    // judge notes as playback passes their hit window and draws a small
+    // red dot at any note that was never hit — a swept note counts as a
+    // miss for the combined accuracy too, not just per-hand (without this
+    // the denominator would only count wrong key-presses, inflating
+    // accuracy for a chart the user simply skipped over).
+    let _svMissCanvas    = null;
+    let _svMissSweepIdx  = 0;
+    let _svLastSweepTime = -1;   // for backward-seek detection
+    const _svMissNotes      = new Set();   // noteKeys of swept-miss notes
+    const _svMissEntryByKey = new Map();   // noteKey → judge-list entry
 
     // ── Note-detection binding (this instance's chart-scoped context) ──
     let _svNdBindingId = null;
@@ -1352,6 +1428,19 @@ function createFactory() {
         ].join(';');
         c.appendChild(marker);
 
+        // Miss-dot overlay canvas — below the marker's z-index so the
+        // playback cursor still draws on top of it.
+        const missCanvas = document.createElement('canvas');
+        missCanvas.id = 'staffview-miss-' + _instanceId;
+        missCanvas.style.cssText =
+            'position:absolute;top:0;left:0;pointer-events:none;z-index:3;display:block';
+        c.appendChild(missCanvas);
+
+        mount.appendChild(c);
+        _svContainer  = c;
+        _svAtMount    = inner;
+        _svMarker     = marker;
+        _svMissCanvas = missCanvas;
         // Loop overlay: green A/B marker bars + a region-rect wrapper,
         // initially hidden (Group B1-a).
         function _mkLoopMarker(label) {
@@ -1661,6 +1750,8 @@ function createFactory() {
         _svContainer.style.top    = topInset + 'px';
         _svContainer.style.height = Math.max(0, mount.clientHeight - topInset - bottomInset) + 'px';
         _svUpdateMarker();
+        _svResizeMissCanvas();
+        _svRedrawAllMissDots();
     }
 
     function _svRemoveContainer() {
@@ -1676,9 +1767,10 @@ function createFactory() {
                 _svPrevMountPos = null;
             }
             _svContainer.remove();
-            _svContainer      = null;
-            _svAtMount        = null;
-            _svMarker         = null;
+            _svContainer  = null;
+            _svAtMount    = null;
+            _svMarker     = null;
+            _svMissCanvas = null;
             _svLoopMarkerA    = null;
             _svLoopMarkerB    = null;
             _svLoopRegionWrap = null;
@@ -2442,10 +2534,55 @@ function createFactory() {
         zoomSection.appendChild(zoomRow);
         zoomSection.appendChild(resetWrap);
 
+        // ── HAND section (LH/RH isolation) ────────────────────────
+        // Hidden by default; shown only for grand-staff (≥2 staves) scores,
+        // toggled in scoreLoaded. Clicking a hand isolates it (dims the other
+        // staff + judges only that hand); clicking it again returns to Both.
+        const handSection = document.createElement('div');
+        handSection.style.cssText =
+            'margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;display:none';
+
+        const handLabel = document.createElement('span');
+        handLabel.className = 'section-practice-label';
+        handLabel.textContent = 'HAND';
+
+        const handRow = document.createElement('div');
+        handRow.className = 'section-practice-controls-row';
+        handRow.style.cssText = 'margin-top:4px;gap:6px';
+
+        const rhBtn = document.createElement('button');
+        rhBtn.type = 'button';
+        rhBtn.textContent = 'RH';
+        rhBtn.title = 'Right hand only — click again to reset to Both';
+        rhBtn.className = btnCls;
+        rhBtn.style.opacity = '0.7';
+        rhBtn.addEventListener('click',
+            () => _svSetActiveHands(_svActiveHands === 'rh' ? 'both' : 'rh'));
+
+        const lhBtn = document.createElement('button');
+        lhBtn.type = 'button';
+        lhBtn.textContent = 'LH';
+        lhBtn.title = 'Left hand only — click again to reset to Both';
+        lhBtn.className = btnCls;
+        lhBtn.style.opacity = '0.7';
+        lhBtn.addEventListener('click',
+            () => _svSetActiveHands(_svActiveHands === 'lh' ? 'both' : 'lh'));
+
+        handRow.appendChild(rhBtn);
+        handRow.appendChild(lhBtn);
+        handSection.appendChild(handLabel);
+        handSection.appendChild(handRow);
+
+        _svHandRow = handSection;
+        _svRhBtn   = rhBtn;
+        _svLhBtn   = lhBtn;
+        _svUpdateHandButtons();   // reflect current _svActiveHands
+
         popover.appendChild(midiSection);
         popover.appendChild(explorerSection);
         popover.appendChild(layoutSection);
         popover.appendChild(zoomSection);
+        popover.appendChild(handSection);
 
         // ── Toggle popover on pill click ───────────────────────────
         pill.addEventListener('click', () => {
@@ -2541,6 +2678,9 @@ function createFactory() {
         _svZoomLabel      = null;
         _svZoomMinusBtn   = null;
         _svZoomPlusBtn    = null;
+        _svHandRow        = null;
+        _svRhBtn          = null;
+        _svLhBtn          = null;
     }
 
     // ── Error banner ───────────────────────────────────────────────
@@ -2716,8 +2856,17 @@ function createFactory() {
             if (_svInitToken !== myToken) return;
             _svAtBeats  = _svBuildBeatTimeline(score);
             _svLastBeat = null;
+            // A fresh chart starts un-isolated (Both) — the new render carries
+            // no hand colouring, and a single-staff chart has no hands to split.
+            _svActiveHands = 'both';
+            _svUpdateHandButtons();
             _svJudgeRebuiltFromBeats = false;
             _svBuildJudgeLists(score);
+            // Show the HAND toggles only for grand-staff (≥2 staves) scores.
+            if (_svHandRow) {
+                const staves = score.tracks && score.tracks[0] && score.tracks[0].staves;
+                _svHandRow.style.display = (staves && staves.length >= 2) ? '' : 'none';
+            }
             const seq = _svNdLoadSeq;
             _svNdOpenBindingForChart(seq);
         });
@@ -2733,6 +2882,9 @@ function createFactory() {
             if (_svContainer) _svContainer.style.visibility = '';
             if (_svHighwayCanvas) _svHighwayCanvas.style.visibility = 'hidden';
             _svSetHighwayVisible(false);
+            // Notation is now on screen — pull core's top-bar HUD down out of
+            // the way of the grand staff.
+            _svSetNotationShowing(instance, true);
 
             _svFailedFile = null;
             _svFailedArr  = null;
@@ -2741,6 +2893,19 @@ function createFactory() {
             // Re-place marker and loop overlay after each layout (boundsLookup
             // is freshly valid).
             _svUpdateMarker();
+
+            // Re-size and repaint the miss-dot overlay after each relayout.
+            _svResizeMissCanvas();
+            _svRedrawAllMissDots();
+            // boundsLookup may not be populated yet on the first renderFinished;
+            // if the canvas height is still 0, retry once on the next frame.
+            if (_svMissCanvas && _svMissCanvas.height === 0) {
+                requestAnimationFrame(() => {
+                    if (_svInitToken !== myToken) return;
+                    _svResizeMissCanvas();
+                    _svRedrawAllMissDots();
+                });
+            }
             _svUpdateLoopOverlay(_svLoopStartBeat, _svLoopEndBeat);
         });
 
@@ -2757,6 +2922,8 @@ function createFactory() {
             if (_svContainer) _svContainer.style.visibility = 'hidden';
             if (_svHighwayCanvas) _svHighwayCanvas.style.visibility = _svPrevVisibility || '';
             _svSetHighwayVisible(null);
+            // Notation no longer on screen — restore core's HUD to the top bar.
+            _svSetNotationShowing(instance, false);
             const msg = (e && e.message) ? e.message : (typeof e === 'string' ? e : 'render failed');
             _svShowErrorBanner(msg);
         });
@@ -3121,6 +3288,7 @@ function createFactory() {
                                 const entry = {
                                     midi, t, hand: si,
                                     noteKey: si + '|' + (bar.index || 0) + '|' + abs + '|' + midi,
+                                    beat, noteIdx: ni,
                                 };
                                 all.push(entry);
                                 if (si === 0) rh.push(entry);
@@ -3137,7 +3305,12 @@ function createFactory() {
         _svJudgeNotesAll = all;
         _svJudgeNotesRH  = rh;
         _svJudgeNotesLH  = lh;
-        _svHitNoteKeys.clear();
+        _svMissEntryByKey.clear();
+        for (const e of all) _svMissEntryByKey.set(e.noteKey, e);
+        // Clean slate; also re-syncs the sweep past the current playback time
+        // so notes already in the past when the chart loads are never
+        // retroactively missed.
+        _svResetJudgeState();
     }
 
     // Returns the MIDI range spanned by the loaded score's judge notes, or
@@ -3158,7 +3331,9 @@ function createFactory() {
     // tolerance (HIT_TOLERANCE_S), matching keys_highway_3d.
 
     function _svJudgeHit(playedMidi, playedTime) {
-        const notes = _svJudgeNotesAll;
+        const notes = _svActiveHands === 'rh' ? _svJudgeNotesRH
+                    : _svActiveHands === 'lh' ? _svJudgeNotesLH
+                    : _svJudgeNotesAll;
         if (!notes || !notes.length) return null;
         for (let i = 0; i < notes.length; i++) {
             const n = notes[i];
@@ -3169,14 +3344,329 @@ function createFactory() {
                     && !_svHitNoteKeys.has(n.noteKey)) {
                 _svHitNoteKeys.add(n.noteKey);
                 _svHits++;
+                if (n.hand === 0) _svHitsRH++; else _svHitsLH++;
                 _svStreak++;
                 if (_svStreak > _svBestStreak) _svBestStreak = _svStreak;
+                // Replay: a note previously swept-missed is being hit now —
+                // erase its dot so the overlay reflects the successful retry.
+                if (_svMissNotes.has(n.noteKey)) {
+                    _svMissNotes.delete(n.noteKey);
+                    _svRedrawAllMissDots();
+                }
+                _svUpdateScoreBadge();
+                _svEmitNoteResult(true, n);
                 return n.noteKey;
             }
         }
         _svMisses++;
+        _svWrongKeyMissTimes.push(playedTime);
         _svStreak = 0;
+        _svUpdateScoreBadge();
+        // Wrong-key press — no chart note matched; report the played time so
+        // core can still drop it on a backward-seek rebuild.
+        _svEmitNoteResult(false, { t: playedTime, midi: playedMidi });
         return null;
+    }
+
+    // Bare bus events (no payload read by either consumer) that bridge our
+    // judgment into the core stats pipeline — stats-recorder.js /
+    // live-performance-hud.js listen for exactly these two names, matching
+    // what the (optional) feedBack-plugin-notedetect emits. Without this,
+    // our note-detection domain reporting (PR4a) is invisible to core's
+    // HUD/dashboard/song_stats — the two systems are otherwise unconnected.
+    function _svEmitNoteResult(hit, note) {
+        if (window.feedBack && typeof window.feedBack.emit === 'function') {
+            // Core's HUD keys off detail.noteTime to drop judgments at/after the
+            // seek position on a backward-seek rebuild — an empty payload can
+            // never be dropped, so replay would permanently double-count. Carry
+            // the note time (plus hand/midi where cheap, matching note_detect).
+            const detail = {};
+            if (note) {
+                if (note.t !== undefined)    detail.noteTime = note.t;
+                if (note.hand !== undefined) detail.hand = note.hand;
+                if (note.midi !== undefined) detail.midi = note.midi;
+            }
+            window.feedBack.emit(hit ? 'note:hit' : 'note:miss', detail);
+        }
+    }
+
+    // Accuracy as a percentage, matching core's lib/song_score.py:
+    // accuracy = hits / max(1, hits + misses).
+    function _svAccuracyPct(hits, misses) {
+        const total = hits + misses;
+        return total > 0 ? (hits / total) * 100 : 0;
+    }
+
+    // Get (lazily creating) our per-hand line as the last child of core's
+    // live HUD box. Returns null when the HUD doesn't exist (v2 / not yet in
+    // the DOM). Reuses a core HUD line class so it inherits the HUD's theming.
+    // Re-appends if a relayout ever detached it. Single shared node id — one
+    // global HUD means the focused instance's figures win in splitscreen.
+    function _svHandAccEl() {
+        const hud = document.getElementById('v3-live-performance-hud');
+        if (!hud) return null;
+        let el = document.getElementById('staffview-hand-acc');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'staffview-hand-acc';
+            el.className = 'v3-live-performance-streak';
+        }
+        if (el.parentElement !== hud) hud.appendChild(el);
+        return el;
+    }
+
+    // Refresh our per-hand (RH/LH) accuracy line inside core's live HUD.
+    // We inject a single line as the last child of #v3-live-performance-hud
+    // (see _svHandAccEl) — core's own line already shows the aggregate, so
+    // ours surfaces only the per-hand split it can't. Shown only on two-staff
+    // scores once at least one note is judged. Per-hand denominators count
+    // that hand's own swept (skipped) notes; a wrong key-press can't be
+    // attributed to a hand, so it lands only in the combined figure. v3-only:
+    // no HUD element ⇒ no-op (v2 has no live scoreboard).
+    function _svUpdateScoreBadge() {
+        const el = _svHandAccEl();
+        if (!el) return;
+        const twoStaff = _svJudgeNotesRH && _svJudgeNotesRH.length
+                      && _svJudgeNotesLH && _svJudgeNotesLH.length;
+        if (!twoStaff || (_svHits + _svMisses) <= 0) {
+            el.style.display = 'none';
+            return;
+        }
+        const rh = _svAccuracyPct(_svHitsRH, _svMissesRH);
+        const lh = _svAccuracyPct(_svHitsLH, _svMissesLH);
+        el.textContent = `RH ${rh.toFixed(0)}%  ·  LH ${lh.toFixed(0)}%`;
+        el.style.display = '';
+    }
+
+    // ── Miss-dot overlay: sizing, drawing, sweep ────────────────────────
+    // The overlay canvas is pinned to the alphaTab render mount and sized to
+    // the full scroll extent so dots stay aligned with noteheads as the score
+    // is scrolled. alphaTab renders its SVGs position:absolute, so on the
+    // first renderFinished scrollHeight can be 0 — fall back to boundsLookup
+    // staff-system extents in that case.
+    function _svResizeMissCanvas() {
+        if (!_svMissCanvas || !_svAtMount) return;
+        _svMissCanvas.style.left = _svAtMount.offsetLeft + 'px';
+        _svMissCanvas.style.top  = _svAtMount.offsetTop  + 'px';
+        const w = _svAtMount.scrollWidth  || _svAtMount.clientWidth;
+        let h   = _svAtMount.scrollHeight || _svAtMount.clientHeight;
+        if (!h) {
+            const bl = _svApi && _svApi.boundsLookup;
+            if (bl && bl.staffSystems) {
+                for (const sys of (bl.staffSystems || [])) {
+                    const vb = sys && sys.visualBounds;
+                    if (vb) h = Math.max(h, vb.y + vb.h);
+                }
+            }
+        }
+        _svMissCanvas.width  = w;
+        _svMissCanvas.height = h;
+    }
+
+    // Draw a single red dot immediately left of the missed note's head, using
+    // the beat/noteIdx references stored on the judge entry so we can query
+    // boundsLookup.findBeat(...).notes[ni].noteHeadBounds without re-walking
+    // the score model.
+    function _svDrawMissDot(ctx, entry) {
+        const bl = _svApi && _svApi.boundsLookup;
+        if (!bl || typeof bl.findBeat !== 'function') return;
+        const beatBounds = bl.findBeat(entry.beat);
+        if (!beatBounds || !beatBounds.notes) return;
+        const nb = beatBounds.notes[entry.noteIdx];
+        if (!nb || !nb.noteHeadBounds) return;
+        const nhb = nb.noteHeadBounds;
+        const r = 2, gap = 2;
+        ctx.beginPath();
+        ctx.arc(Math.round(nhb.x - gap - r), Math.round(nhb.y + nhb.h / 2), r, 0, Math.PI * 2);
+        ctx.fillStyle = '#ef4444';
+        ctx.fill();
+    }
+
+    // Full repaint of every recorded miss dot — cheap, and the only reliable
+    // way to keep dots aligned after an alphaTab relayout (bounds change).
+    function _svRedrawAllMissDots() {
+        if (!_svMissCanvas) return;
+        const ctx = _svMissCanvas.getContext('2d');
+        if (!ctx) return;
+        ctx.clearRect(0, 0, _svMissCanvas.width, _svMissCanvas.height);
+        for (const key of _svMissNotes) {
+            const entry = _svMissEntryByKey.get(key);
+            if (entry) _svDrawMissDot(ctx, entry);
+        }
+    }
+
+    // Backward seek (or replay from earlier): notes at/after the new position
+    // are un-judged so they can be re-scored on the next pass. Miss dots for
+    // those notes are cleared ("overwrite on replay"); dots for sections not
+    // yet replayed stay visible until the player reaches them again.
+    function _svHandleSeek(newTime) {
+        if (!_svJudgeNotesAll) return;
+        let changed = false;
+        // Un-score the rolled-back region: as each swept-miss dot and hit-claim
+        // for a note at/after newTime is cleared, decrement the matching tally
+        // (per-hand + combined) so a replay pass re-counts instead of inflating
+        // the denominator. Guard against negative on double-seek. hand 0 = RH.
+        for (const key of _svMissNotes) {
+            const entry = _svMissEntryByKey.get(key);
+            if (entry && entry.t >= newTime) {
+                _svMissNotes.delete(key);
+                _svMisses = Math.max(0, _svMisses - 1);
+                if (entry.hand === 0) _svMissesRH = Math.max(0, _svMissesRH - 1);
+                else                  _svMissesLH = Math.max(0, _svMissesLH - 1);
+                changed = true;
+            }
+        }
+        for (const e of _svJudgeNotesAll) {
+            if (e.t >= newTime && _svHitNoteKeys.delete(e.noteKey)) {
+                _svHits = Math.max(0, _svHits - 1);
+                if (e.hand === 0) _svHitsRH = Math.max(0, _svHitsRH - 1);
+                else              _svHitsLH = Math.max(0, _svHitsLH - 1);
+            }
+        }
+        // Wrong-key misses have no dot/entry above; roll back the ones played
+        // at/after newTime (combined tally only — they carry no hand).
+        for (let i = _svWrongKeyMissTimes.length - 1; i >= 0; i--) {
+            if (_svWrongKeyMissTimes[i] >= newTime) {
+                _svWrongKeyMissTimes.splice(i, 1);
+                _svMisses = Math.max(0, _svMisses - 1);
+            }
+        }
+        _svMissSweepIdx = 0;
+        while (_svMissSweepIdx < _svJudgeNotesAll.length &&
+               _svJudgeNotesAll[_svMissSweepIdx].t < newTime - HIT_TOLERANCE_S - 0.05) {
+            _svMissSweepIdx++;
+        }
+        if (changed) _svRedrawAllMissDots();
+        _svUpdateScoreBadge();
+    }
+
+    // Monotonic sweep over the judge list as playback advances: any chart note
+    // whose hit window has fully closed without a matching MIDI hit is recorded
+    // as a swept miss — a red dot, and a miss for both the per-hand and the
+    // combined counters (so skipping notes can't inflate accuracy). Detects a
+    // backward jump (>0.5s) via _svLastSweepTime and rewinds state first.
+    function _svSweepMisses(currentTime) {
+        if (!_svMissCanvas || !_svJudgeNotesAll || !_svJudgeNotesAll.length) return;
+        if (currentTime === null || currentTime < 0) return;
+        // Any jump >0.5s in EITHER direction is a seek, not natural playback
+        // (which advances well under 0.5s per frame). Re-sync the sweep index
+        // to the new position without marking the jumped-over region: a forward
+        // seek (click-to-seek, section jump, platform seek-ahead) must not paint
+        // the skipped span red — only notes actually passed during playback are
+        // misses. _svHandleSeek's index walk and cleanup are direction-agnostic.
+        if (_svLastSweepTime >= 0 && Math.abs(currentTime - _svLastSweepTime) > 0.5) {
+            _svHandleSeek(currentTime);
+        }
+        _svLastSweepTime = currentTime;
+        const cutoff = currentTime - HIT_TOLERANCE_S - 0.05;
+        const ctx = _svMissCanvas.getContext('2d');
+        while (_svMissSweepIdx < _svJudgeNotesAll.length) {
+            const n = _svJudgeNotesAll[_svMissSweepIdx];
+            if (n.t > cutoff) break;
+            _svMissSweepIdx++;
+            // In an isolated-hand session only the active hand is judged.
+            if (_svActiveHands !== 'both'
+                    && n.hand !== (_svActiveHands === 'rh' ? 0 : 1)) continue;
+            if (!_svHitNoteKeys.has(n.noteKey) && !_svMissNotes.has(n.noteKey)) {
+                _svMissNotes.add(n.noteKey);
+                if (ctx) _svDrawMissDot(ctx, n);
+                if (n.hand === 0) _svMissesRH++; else _svMissesLH++;
+                _svMisses++;
+                _svStreak = 0;
+                _svUpdateScoreBadge();
+                _svEmitNoteResult(false, n);
+            }
+        }
+    }
+
+    // ── LH/RH hand isolation ────────────────────────────────────────────
+    // Restart the live judging session: counters, claimed sets, sweep cursor
+    // and the miss-dot canvas back to a clean slate, then re-sync the sweep
+    // cursor to the current playback position so notes already in the past are
+    // not retroactively marked missed. Shared by chart (re)load and hand
+    // switches — both change what counts, so both restart scoring.
+    function _svResetJudgeState() {
+        _svHitNoteKeys.clear();
+        _svMissNotes.clear();
+        _svMissSweepIdx  = 0;
+        _svLastSweepTime = -1;
+        _svHits = 0; _svMisses = 0; _svStreak = 0; _svBestStreak = 0;
+        _svHitsRH = 0; _svMissesRH = 0; _svHitsLH = 0; _svMissesLH = 0;
+        _svWrongKeyMissTimes.length = 0;
+        const now = _svGetCurrentTime();
+        if (_svJudgeNotesAll && now && now > 0) {
+            while (_svMissSweepIdx < _svJudgeNotesAll.length
+                   && _svJudgeNotesAll[_svMissSweepIdx].t < now) {
+                _svMissSweepIdx++;
+            }
+        }
+        _svRedrawAllMissDots();   // miss set is empty → clears the canvas
+        _svUpdateScoreBadge();
+    }
+
+    function _svUpdateHandButtons() {
+        if (_svRhBtn) {
+            _svRhBtn.style.opacity   = (_svActiveHands === 'rh') ? '1' : '0.7';
+            _svRhBtn.style.boxShadow = (_svActiveHands === 'rh') ? '0 0 0 1px #22c55e' : '';
+        }
+        if (_svLhBtn) {
+            _svLhBtn.style.opacity   = (_svActiveHands === 'lh') ? '1' : '0.7';
+            _svLhBtn.style.boxShadow = (_svActiveHands === 'lh') ? '0 0 0 1px #22c55e' : '';
+        }
+    }
+
+    // Switch which hand is judged ('both' | 'rh' | 'lh'). Isolating a hand
+    // changes what scores, so it restarts the session and re-colours the score.
+    function _svSetActiveHands(hand) {
+        if (hand === _svActiveHands) return;
+        _svActiveHands = hand;
+        _svResetJudgeState();
+        _svUpdateHandButtons();
+        _svApplyHandColors();
+    }
+
+    // Dim the inactive staff using alphaTab's native per-element colouring,
+    // then re-render. Colours live on the model objects, so they survive
+    // layout reflows and only need re-applying on an explicit switch (NOT from
+    // renderFinished, which would loop). Switching back to 'both' resets the
+    // styles. Grand staff only (needs ≥ 2 staves).
+    function _svApplyHandColors() {
+        if (!_svApi || !_svApiReady || !window.alphaTab) return;
+        const score = _svApi.score;
+        if (!score || !score.tracks || !score.tracks.length) return;
+        const track = score.tracks[0];
+        if (!track.staves || track.staves.length < 2) return;
+
+        const m      = window.alphaTab.model;
+        const grey   = m.Color.fromJson('#c0c0c0');
+        const dimIdx = _svActiveHands === 'rh' ? 1 : 0;
+
+        for (let si = 0; si < track.staves.length; si++) {
+            const dim = _svActiveHands !== 'both' && si === dimIdx;
+            for (const bar of track.staves[si].bars) {
+                for (const voice of bar.voices) {
+                    for (const beat of voice.beats) {
+                        if (dim) {
+                            if (!beat.style) beat.style = new m.BeatStyle();
+                            for (const k of Object.values(m.BeatSubElement))
+                                beat.style.colors.set(k, grey);
+                        } else {
+                            beat.style = new m.BeatStyle();
+                        }
+                        for (const note of beat.notes) {
+                            if (dim) {
+                                if (!note.style) note.style = new m.NoteStyle();
+                                for (const k of Object.values(m.NoteSubElement))
+                                    note.style.colors.set(k, grey);
+                            } else {
+                                note.style = new m.NoteStyle();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        try { _svApi.render(); } catch (_) {}
     }
 
     // ── MIDI event handlers (called by the module-level _svMidiOnMessage,
@@ -3256,6 +3746,9 @@ function createFactory() {
 
     function _svTeardown(restoreCanvas) {
         if (_svMarkerRefreshTimer) { clearInterval(_svMarkerRefreshTimer); _svMarkerRefreshTimer = null; }
+        // Notation is going away — restore core's HUD to the top bar (no-op if
+        // this instance wasn't the one showing notation).
+        _svSetNotationShowing(instance, false);
         _svTooltipDismissAll();
         _svTooltip     = null;
         _svLastTapTime = 0;
@@ -3275,6 +3768,12 @@ function createFactory() {
         _svNotationReady = false;
         _svRendered      = false;
 
+        // Reset miss-dot sweep state (the canvas itself goes with the
+        // container in _svRemoveContainer below).
+        _svMissNotes.clear();
+        _svMissEntryByKey.clear();
+        _svMissSweepIdx  = 0;
+        _svLastSweepTime = -1;
         // Cancel any in-flight drag gesture.
         if (_svDragCleanup) { _svDragCleanup(); _svDragCleanup = null; }
         _svDragArmed = false; _svDragActive = false; _svDragBeat = null;
@@ -3414,6 +3913,7 @@ function createFactory() {
             }
 
             _svSyncCursor(bundle.currentTime);
+            _svSweepMisses(bundle.currentTime);
         },
 
         resize(/* w, h */) {
