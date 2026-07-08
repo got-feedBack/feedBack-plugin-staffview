@@ -481,7 +481,8 @@ function createFactory() {
     // Stored as plain values so instance creation doesn't touch alphaTab
     // (not loaded yet) — applied to the AlphaTabApi settings in _svInitAlphaTab.
     let _svLayoutIsHoriz = _svReadStore(_SV_STORE_LAYOUT) === 'horizontal';
-    let _svScale         = parseFloat(_svReadStore(_SV_STORE_SCALE) || '1.0');
+    let _svScaleStored   = parseFloat(_svReadStore(_SV_STORE_SCALE));
+    let _svScale         = _svClampScale(Number.isFinite(_svScaleStored) ? _svScaleStored : 1.0);
     let _svLayoutPageBtn  = null;
     let _svLayoutHorizBtn = null;
     let _svZoomLabel      = null;
