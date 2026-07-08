@@ -13,6 +13,9 @@
 //   - No alphaTab synth: the host owns audio (OGG). enablePlayer:false drops
 //     the soundfont CDN download entirely, same rationale as tabview.
 //   - Cursor sync: bundle.beats → tick lookup drives the marker
+//   - Options pill (v3 plugin-control slot / v2 #player-footer / splitscreen
+//     panel): LAYOUT (page/horizontal) and ZOOM controls, persisted to
+//     localStorage
 //
 // Module-scope singletons:
 //   - alphaTab CDN load promise (one <script> per page)
@@ -43,6 +46,10 @@ const TICK_DELTA_THRESHOLD = 30;
 // alphaTab Duration: Whole=1 Half=2 Quarter=4 Eighth=8 Sixteenth=16 ThirtySecond=32
 const DUR_MAP = { 1: 1, 2: 2, 4: 4, 8: 8, 16: 16, 32: 32 };
 
+// localStorage keys for pill-controlled, session-persisted preferences.
+const _SV_STORE_LAYOUT = 'staffview_layout';
+const _SV_STORE_SCALE  = 'staffview_scale';
+
 // ═══════════════════════════════════════════════════════════════════════
 // Module-level singletons
 // ═══════════════════════════════════════════════════════════════════════
@@ -50,6 +57,19 @@ const DUR_MAP = { 1: 1, 2: 2, 4: 4, 8: 8, 16: 16, 32: 32 };
 let _svFilename       = null;   // captured from playSong wrap + arrangement:changed
 let _nextInstanceId   = 0;
 let _atLoadPromise    = null;   // memoized alphaTab CDN script load
+
+// ═══════════════════════════════════════════════════════════════════════
+// localStorage helpers (swallow quota / privacy-mode errors)
+// ═══════════════════════════════════════════════════════════════════════
+
+function _svReadStore(k)    { try { return localStorage.getItem(k); }     catch (_) { return null; } }
+function _svSaveStore(k, v) { try { localStorage.setItem(k, String(v)); } catch (_) {} }
+
+// Zoom clamp: 50%-200% in 5% steps. Pulled out of _svSetScale so the pure
+// math is independently testable (tests/zoom.test.js).
+function _svClampScale(value) {
+    return Math.max(0.5, Math.min(2.0, Math.round(value * 20) / 20));
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // alphaTab CDN loader
@@ -125,9 +145,20 @@ function _resolveMount(canvas) {
 
 // v3 player chrome (docs/plugin-v3-ui.md): v3's #player-hud / #player-controls
 // are position:absolute overlays that consume no layout space, so container
-// sizing must not subtract their heights (see _svSizeContainer).
+// sizing must not subtract their heights (see _svSizeContainer). _isV3() also
+// gates the pill mount path below.
 function _isV3() {
     return !!(window.feedBack && window.feedBack.uiVersion === 'v3');
+}
+
+// v3 controls injected into the player must mount into the stable
+// plugin-control slot instead of the auto-hiding transport / footer.
+// Returns null on v2 so callers fall back to #player-footer unchanged.
+function _playerSlot() {
+    return (_isV3()
+        && window.feedBack.ui
+        && typeof window.feedBack.ui.playerControlSlot === 'function')
+        ? window.feedBack.ui.playerControlSlot() : null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -446,6 +477,37 @@ function createFactory() {
     let _svLastTick     = -1;
     let _svLatestBeats  = null; // bundle.beats snapshot
 
+    // ── Layout mode and zoom (persisted, read once at factory creation) ────
+    // Stored as plain values so instance creation doesn't touch alphaTab
+    // (not loaded yet) — applied to the AlphaTabApi settings in _svInitAlphaTab.
+    let _svLayoutIsHoriz = _svReadStore(_SV_STORE_LAYOUT) === 'horizontal';
+    let _svScaleStored   = parseFloat(_svReadStore(_SV_STORE_SCALE));
+    let _svScale         = _svClampScale(Number.isFinite(_svScaleStored) ? _svScaleStored : 1.0);
+    let _svLayoutPageBtn  = null;
+    let _svLayoutHorizBtn = null;
+    let _svZoomLabel      = null;
+    let _svZoomMinusBtn   = null;
+    let _svZoomPlusBtn    = null;
+    let _svMarkerRefreshTimer = null; // bounded poll after a settings-only render
+
+    // ── Options pill / popover UI state ─────────────────────────────
+    // _svPillWrap: the wrapper element appended to the v3 plugin-control
+    // slot, v2 #player-footer, or the splitscreen panel. Removed in
+    // _svRemovePill(). _svPillRetries/_svPillRetryTimer/_svSlotObserver:
+    // the v3 slot may not exist yet on first mount attempt — poll a bounded
+    // number of times, then fall back to a one-shot MutationObserver.
+    // _svPopoverCloseHandler/_svPopoverDeferTimer: the capture-phase
+    // document mousedown listener that closes the popover on outside click;
+    // must be torn down in _svRemovePill() even if the popover is open at
+    // teardown time, or the listener survives and pins the detached DOM.
+    let _svPillWrap             = null;
+    let _svPillRetryTimer       = null;
+    let _svPillRetries          = 0;
+    const _SV_PILL_MAX_RETRIES  = 20;   // ~5s of 250ms polls for the v3 slot
+    let _svSlotObserver         = null; // MutationObserver fallback when polls exhaust
+    let _svPopoverCloseHandler  = null;
+    let _svPopoverDeferTimer    = null;
+
     // ── Window resize ref ──────────────────────────────────────────
     const _onWinResize = () => _svSizeContainer();
 
@@ -485,10 +547,20 @@ function createFactory() {
             'background:#fff',     // white — alphaTab renders black ink on its own
                                    // SVG surfaces; the container color shows through
             'z-index:5',
-        ].join(';');
+            // Horizontal layout is a single short row — centre it vertically
+            // to use the container height. Kept in sync at runtime by
+            // _svSetLayout(); _svAtMount.offsetTop-based overlay positioning
+            // (marker, tooltips) needs no further changes for this.
+            _svLayoutIsHoriz ? 'display:flex;align-items:center' : '',
+        ].filter(Boolean).join(';');
 
         const inner = document.createElement('div');
         inner.id = 'staffview-at-' + _instanceId;
+        // In flex context a child div shrinks to content instead of filling
+        // 100% of the parent; alphaTab measures this div's width before
+        // rendering and skips entirely when it reads 0 — explicit width
+        // keeps horizontal-layout loads from rendering blank.
+        inner.style.width = '100%';
         c.appendChild(inner);
 
         // Playback marker — boundsLookup-driven (slopsmith#734 pattern).
@@ -562,6 +634,8 @@ function createFactory() {
             }
         }
 
+        _svCreatePill();
+
         return c;
     }
 
@@ -596,6 +670,7 @@ function createFactory() {
             try { _svControlsObserver.disconnect(); } catch (_) {}
             _svControlsObserver = null;
         }
+        _svRemovePill();
         if (_svContainer) {
             if (_svPrevMountPos !== null) {
                 const mount = _svContainer.parentElement;
@@ -607,6 +682,401 @@ function createFactory() {
             _svAtMount   = null;
             _svMarker    = null;
         }
+    }
+
+    // ── Layout mode and zoom controls ───────────────────────────────
+
+    // A settings-only re-render (updateSettings()+render(), no score reload)
+    // does not reliably leave boundsLookup and the DOM reflow both settled
+    // by the time renderFinished fires — measured empirically: toggling
+    // layout can return boundsLookup geometry frozen from the *previous*
+    // layout, and/or an unsettled container flex-centering offset. How long
+    // this takes to settle scales with the score's actual layout complexity
+    // (note density, page/system count) rather than elapsed frames — a
+    // short piece settles within a couple of frames, a dense multi-page one
+    // can take noticeably longer — so a fixed frame-count delay isn't
+    // reliable. Poll on a bounded interval instead (same shape as the pill's
+    // bounded slot-retry above); repeated _svUpdateMarker() calls are cheap
+    // and idempotent, so polling past the point of settling is harmless.
+    function _svRefreshMarkerAfterSettingsRender() {
+        if (_svMarkerRefreshTimer) { clearInterval(_svMarkerRefreshTimer); _svMarkerRefreshTimer = null; }
+        let tries   = 0;
+        let lastSig = null;
+        // Absolute safety cap only — NOT the intended stop condition. A
+        // fixed try count (equivalently, a fixed wall-clock window) has the
+        // same flaw as the earlier fixed-animation-frame attempt: settle
+        // time scales with the machine's speed and the score's layout
+        // complexity, not elapsed polls, so any fixed bound can in
+        // principle still be too short. The real stop condition below is
+        // "the marker's own computed geometry stopped changing between two
+        // consecutive polls" — that adapts to however long the machine
+        // actually needs. This cap only prevents a pathological case (or
+        // active playback, whose own _svSyncCursor legitimately keeps the
+        // marker moving every frame) from pinning the interval open forever.
+        const MAX_TRIES = 80; // ~12s of 150ms polls
+        _svMarkerRefreshTimer = setInterval(() => {
+            tries += 1;
+            _svUpdateMarker();
+            // _svUpdateMarker() only ever mutates left/top/width/height/
+            // display on this element, so its cssText fully captures
+            // whether this poll actually changed anything visible.
+            const sig = _svMarker ? _svMarker.style.cssText : null;
+            const settled = sig === null || sig === lastSig;
+            lastSig = sig;
+            if (settled || tries >= MAX_TRIES) {
+                clearInterval(_svMarkerRefreshTimer);
+                _svMarkerRefreshTimer = null;
+            }
+        }, 150);
+    }
+
+    function _svSetLayout(isHoriz) {
+        _svLayoutIsHoriz = isHoriz;
+        _svSaveStore(_SV_STORE_LAYOUT, isHoriz ? 'horizontal' : 'page');
+        if (_svLayoutPageBtn) {
+            _svLayoutPageBtn.style.opacity   = isHoriz ? '0.7' : '1';
+            _svLayoutPageBtn.style.boxShadow = isHoriz ? '' : '0 0 0 1px #22c55e';
+        }
+        if (_svLayoutHorizBtn) {
+            _svLayoutHorizBtn.style.opacity   = isHoriz ? '1' : '0.7';
+            _svLayoutHorizBtn.style.boxShadow = isHoriz ? '0 0 0 1px #22c55e' : '';
+        }
+        if (_svContainer) {
+            _svContainer.style.display    = isHoriz ? 'flex' : '';
+            _svContainer.style.alignItems = isHoriz ? 'center' : '';
+        }
+        if (!_svApi) return;
+        _svApi.settings.display.layoutMode = isHoriz
+            ? alphaTab.LayoutMode.Horizontal
+            : alphaTab.LayoutMode.Page;
+        _svApi.updateSettings();
+        _svApi.render();
+        _svRefreshMarkerAfterSettingsRender();
+    }
+
+    function _svSetScale(value) {
+        _svScale = _svClampScale(value);
+        _svSaveStore(_SV_STORE_SCALE, String(_svScale));
+        if (_svZoomLabel)    _svZoomLabel.textContent = Math.round(_svScale * 100) + '%';
+        if (_svZoomMinusBtn) _svZoomMinusBtn.disabled = _svScale <= 0.5;
+        if (_svZoomPlusBtn)  _svZoomPlusBtn.disabled  = _svScale >= 2.0;
+        if (!_svApi) return;
+        _svApi.settings.display.scale = _svScale;
+        _svApi.updateSettings();
+        _svApi.render();
+        _svRefreshMarkerAfterSettingsRender();
+    }
+
+    // ── Options pill ─────────────────────────────────────────────────
+    // A small pill button + popover injected into the v3 plugin-control
+    // slot (main player), #player-footer (v2 main player), or the
+    // splitscreen panelDiv, exposing formatting controls (layout, zoom).
+    //
+    // Uses platform CSS classes (.section-practice-pill, .v3-pop-btn, etc.)
+    // so the pill looks native across v2 and v3. The popover keeps a
+    // staffview-specific id (sv-popover-{id}) to avoid colliding with
+    // #section-practice-bar; its visual CSS is inlined to match the platform.
+    //
+    // Pill anchor:
+    //   v3 main player → feedBack.ui.playerControlSlot() (bounded retry +
+    //                     MutationObserver fallback if the slot isn't
+    //                     mounted yet — see docs/plugin-v3-ui.md)
+    //   v2 main player → document.getElementById('player-footer')
+    //   Splitscreen     → _resolveMount (the panelDiv, position:relative);
+    //                     pill wrapper gets position:absolute; bottom:0;
+    //                     left:8px so it sits at panel bottom-left
+
+    function _svCreatePill() {
+        if (_svPillWrap) return;
+
+        const inSS   = _ssActive();
+        const slot   = inSS ? null : _playerSlot();
+        // v3: never fall back to #player-footer — that element belongs to
+        // the v2 chrome and auto-hides in v3. If the slot isn't ready yet
+        // the retry path below keeps trying. v2 falls back normally.
+        const footer = inSS ? _resolveMount(_svHighwayCanvas)
+                            : (_isV3() ? slot : (slot || document.getElementById('player-footer')));
+        if (!footer) {
+            // v3 mounts the pill into the plugin-control slot, which the
+            // rail popover may not have created yet on the first call.
+            // Fast path: poll a bounded number of times (covers the common
+            // case where the v3 slot appears within a few seconds of
+            // startup). Fallback: if polls exhaust, arm a MutationObserver
+            // on document.body that fires _svCreatePill exactly once when
+            // the slot element arrives. Splitscreen and v2 have no
+            // late-slot problem so they fall through to a single attempt.
+            if (!inSS && _isV3()) {
+                if (_svPillRetries < _SV_PILL_MAX_RETRIES) {
+                    _svPillRetries += 1;
+                    _svPillRetryTimer = setTimeout(_svCreatePill, 250);
+                } else if (!_svSlotObserver) {
+                    _svSlotObserver = new MutationObserver(function () {
+                        if (_svPillWrap || !_playerSlot()) return;
+                        _svSlotObserver.disconnect();
+                        _svSlotObserver = null;
+                        _svCreatePill();
+                    });
+                    _svSlotObserver.observe(document.body, { childList: true, subtree: true });
+                }
+            }
+            return;
+        }
+        if (_svPillRetryTimer) { clearTimeout(_svPillRetryTimer); _svPillRetryTimer = null; }
+        if (_svSlotObserver)   { _svSlotObserver.disconnect(); _svSlotObserver = null; }
+
+        // ── Wrapper (position:relative — popover anchors off it) ──
+        const wrap = document.createElement('div');
+        wrap.id = 'sv-pill-wrap-' + _instanceId;
+        wrap.className = 'section-practice-control'
+            + (_isV3() && !inSS ? ' section-practice-control--v3' : '');
+        if (inSS) {
+            // Splitscreen absolute position is instance-specific — not a
+            // platform concept, so it stays inline rather than in a class.
+            wrap.style.cssText = 'position:absolute;bottom:0;left:8px;z-index:7';
+        }
+
+        // ── Pill button ───────────────────────────────────────────
+        const pill = document.createElement('button');
+        pill.type = 'button';
+        pill.id   = 'sv-pill-' + _instanceId;
+        pill.className = 'section-practice-pill';
+        pill.setAttribute('aria-haspopup', 'dialog');
+        pill.setAttribute('aria-expanded', 'false');
+        pill.setAttribute('aria-label', 'Staff View options');
+        pill.title = 'Staff View';
+        pill.innerHTML =
+            '<span aria-hidden="true" class="section-practice-pill-icon">♩</span>'
+            + '<span class="section-practice-pill-text">Staff View</span>'
+            + '<span aria-hidden="true" class="section-practice-pill-caret">▾</span>';
+
+        // ── Popover ───────────────────────────────────────────────
+        // v3 non-splitscreen: popover opens rightward (the pill lives in
+        // the icon rail, not the footer). Platform's v3 rule targets the
+        // id #section-practice-bar so the override is applied here directly.
+        const v3Popover = _isV3() && !inSS;
+        const popover = document.createElement('div');
+        popover.id    = 'sv-popover-' + _instanceId;
+        popover.setAttribute('role', 'dialog');
+        popover.setAttribute('aria-label', 'Staff View options');
+        popover.style.cssText = [
+            'display:none',
+            v3Popover ? 'position:absolute' : 'position:fixed',
+            v3Popover ? 'left:calc(100% + 8px)' : 'left:50%',
+            v3Popover ? 'top:0' : '',
+            v3Popover ? '' : 'transform:translateX(-50%)',
+            inSS ? 'z-index:10' : 'z-index:60',
+            'width:max-content',
+            'max-width:min(320px,calc(100vw - 32px))',
+            'padding:10px 14px',
+            'border-radius:12px',
+            'border:1px solid rgba(255,255,255,0.12)',
+            'background:rgba(12,12,22,0.98)',
+            'box-shadow:0 12px 30px rgba(0,0,0,0.5)',
+            'font-family:system-ui,sans-serif',
+            'font-size:12px',
+            'color:#cbd5e1',
+            'pointer-events:auto',
+            // Mobile: without a height cap the popover scrolls off the
+            // bottom of the viewport on small screens. Harmless on desktop,
+            // where the popover never reaches 80vh.
+            'max-height:80vh',
+            'overflow-y:auto',
+            'overscroll-behavior:contain',
+        ].join(';');
+
+        // Header
+        const hdr = document.createElement('span');
+        hdr.className = 'section-practice-label';
+        hdr.style.cssText = 'display:block;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,0.08);margin-bottom:8px';
+        hdr.textContent = 'Staff View';
+        popover.appendChild(hdr);
+
+        const btnCls = _isV3()
+            ? 'v3-pop-btn'
+            : 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition';
+
+        // ── LAYOUT section ────────────────────────────────────────
+        const layoutSection = document.createElement('div');
+
+        const layoutLabel = document.createElement('span');
+        layoutLabel.className = 'section-practice-label';
+        layoutLabel.textContent = 'LAYOUT';
+
+        const layoutRow = document.createElement('div');
+        layoutRow.className = 'section-practice-controls-row';
+        layoutRow.style.marginTop = '4px';
+
+        const pageBtn = document.createElement('button');
+        pageBtn.type = 'button';
+        pageBtn.textContent = 'Page';
+        pageBtn.title = 'Vertical page layout';
+        pageBtn.className = btnCls;
+        pageBtn.addEventListener('click', () => _svSetLayout(false));
+
+        const horizBtn = document.createElement('button');
+        horizBtn.type = 'button';
+        horizBtn.textContent = 'Horiz';
+        horizBtn.title = 'Horizontal scroll layout';
+        horizBtn.className = btnCls;
+        horizBtn.addEventListener('click', () => _svSetLayout(true));
+
+        _svLayoutPageBtn  = pageBtn;
+        _svLayoutHorizBtn = horizBtn;
+
+        // Sync initial visual state.
+        pageBtn.style.opacity    = _svLayoutIsHoriz ? '0.7' : '1';
+        pageBtn.style.boxShadow  = _svLayoutIsHoriz ? '' : '0 0 0 1px #22c55e';
+        horizBtn.style.opacity   = _svLayoutIsHoriz ? '1' : '0.7';
+        horizBtn.style.boxShadow = _svLayoutIsHoriz ? '0 0 0 1px #22c55e' : '';
+
+        layoutRow.appendChild(pageBtn);
+        layoutRow.appendChild(horizBtn);
+        layoutSection.appendChild(layoutLabel);
+        layoutSection.appendChild(layoutRow);
+
+        // ── ZOOM section ──────────────────────────────────────────
+        const zoomSection = document.createElement('div');
+        zoomSection.style.cssText =
+            'margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px';
+
+        const zoomLabel = document.createElement('span');
+        zoomLabel.className = 'section-practice-label';
+        zoomLabel.textContent = 'ZOOM';
+
+        const zoomRow = document.createElement('div');
+        zoomRow.className = 'section-practice-controls-row';
+        zoomRow.style.cssText = 'margin-top:4px;justify-content:center;gap:6px';
+
+        const minusBtn = document.createElement('button');
+        minusBtn.type = 'button';
+        minusBtn.textContent = '−';
+        minusBtn.title = 'Zoom out';
+        minusBtn.className = btnCls;
+        minusBtn.addEventListener('click', () => _svSetScale(_svScale - 0.05));
+
+        const zoomPct = document.createElement('span');
+        zoomPct.style.cssText = 'min-width:2.5em;text-align:center;display:inline-block;font-size:.8rem';
+        zoomPct.textContent = Math.round(_svScale * 100) + '%';
+
+        const plusBtn = document.createElement('button');
+        plusBtn.type = 'button';
+        plusBtn.textContent = '+';
+        plusBtn.title = 'Zoom in';
+        plusBtn.className = btnCls;
+        plusBtn.addEventListener('click', () => _svSetScale(_svScale + 0.05));
+
+        const resetWrap = document.createElement('div');
+        resetWrap.style.cssText = 'text-align:center;margin-top:3px';
+        const resetLink = document.createElement('button');
+        resetLink.type = 'button';
+        resetLink.textContent = 'reset';
+        resetLink.style.cssText =
+            'background:none;border:none;color:rgba(255,255,255,0.4);font-size:.7rem;cursor:pointer;text-decoration:underline;padding:0';
+        resetLink.addEventListener('click', () => _svSetScale(1.0));
+        resetWrap.appendChild(resetLink);
+
+        _svZoomLabel    = zoomPct;
+        _svZoomMinusBtn = minusBtn;
+        _svZoomPlusBtn  = plusBtn;
+
+        // Sync initial disabled state.
+        minusBtn.disabled = _svScale <= 0.5;
+        plusBtn.disabled  = _svScale >= 2.0;
+
+        zoomRow.appendChild(minusBtn);
+        zoomRow.appendChild(zoomPct);
+        zoomRow.appendChild(plusBtn);
+        zoomSection.appendChild(zoomLabel);
+        zoomSection.appendChild(zoomRow);
+        zoomSection.appendChild(resetWrap);
+
+        popover.appendChild(layoutSection);
+        popover.appendChild(zoomSection);
+
+        // ── Toggle popover on pill click ───────────────────────────
+        pill.addEventListener('click', () => {
+            const open = popover.style.display !== 'none';
+            if (open) {
+                popover.style.display = 'none';
+                pill.setAttribute('aria-expanded', 'false');
+                if (_svPopoverDeferTimer) { clearTimeout(_svPopoverDeferTimer); _svPopoverDeferTimer = null; }
+                if (_svPopoverCloseHandler) {
+                    document.removeEventListener('mousedown', _svPopoverCloseHandler, true);
+                    _svPopoverCloseHandler = null;
+                }
+            } else {
+                popover.style.display = 'block';
+                // Clamp popover height to what fits on screen. vh units
+                // include browser chrome (address bar etc.) so always use
+                // window.innerHeight (the actual visible viewport).
+                const viewH = window.innerHeight;
+                if (v3Popover) {
+                    // position:absolute, opens rightward from wrap.
+                    const wrapRect = wrap.getBoundingClientRect();
+                    popover.style.maxHeight = Math.max(120, viewH - wrapRect.top - 8) + 'px';
+                } else {
+                    // position:fixed, always open upward from the pill.
+                    const btnRect = pill.getBoundingClientRect();
+                    popover.style.bottom    = (viewH - btnRect.top + 6) + 'px';
+                    popover.style.top       = '';
+                    popover.style.maxHeight = Math.max(120, btnRect.top - 14) + 'px';
+                }
+                pill.setAttribute('aria-expanded', 'true');
+                _svPopoverCloseHandler = (e) => {
+                    if (!wrap.contains(e.target)) {
+                        popover.style.display = 'none';
+                        pill.setAttribute('aria-expanded', 'false');
+                        document.removeEventListener('mousedown', _svPopoverCloseHandler, true);
+                        _svPopoverCloseHandler = null;
+                    }
+                };
+                // Defer one tick so the triggering click doesn't immediately close.
+                _svPopoverDeferTimer = setTimeout(() => {
+                    _svPopoverDeferTimer = null;
+                    if (_svPopoverCloseHandler) {
+                        document.addEventListener('mousedown', _svPopoverCloseHandler, true);
+                    }
+                }, 0);
+            }
+        });
+
+        wrap.appendChild(popover);
+        wrap.appendChild(pill);
+        if (slot) {
+            // v3 slot: plain append — the legacy prepend anchor reasoning
+            // below applies only to the v2 footer.
+            footer.appendChild(wrap);
+        } else {
+            // Prepend so the pill appears above #player-controls in the
+            // footer, not below it. insertBefore with firstChild works even
+            // when the footer is empty (firstChild is null → appendChild).
+            footer.insertBefore(wrap, footer.firstChild);
+        }
+        _svPillWrap = wrap;
+    }
+
+    function _svRemovePill() {
+        if (_svPillRetryTimer) { clearTimeout(_svPillRetryTimer); _svPillRetryTimer = null; }
+        if (_svSlotObserver)   { _svSlotObserver.disconnect(); _svSlotObserver = null; }
+        // Tear down the popover outside-click handler if the pill is
+        // removed (teardown/destroy) while the popover is still open —
+        // otherwise the document-level capture listener survives and pins
+        // the detached DOM.
+        if (_svPopoverDeferTimer) { clearTimeout(_svPopoverDeferTimer); _svPopoverDeferTimer = null; }
+        if (_svPopoverCloseHandler) {
+            document.removeEventListener('mousedown', _svPopoverCloseHandler, true);
+            _svPopoverCloseHandler = null;
+        }
+        _svPillRetries = 0;
+        if (_svPillWrap) {
+            _svPillWrap.remove();
+            _svPillWrap = null;
+        }
+        _svLayoutPageBtn  = null;
+        _svLayoutHorizBtn = null;
+        _svZoomLabel      = null;
+        _svZoomMinusBtn   = null;
+        _svZoomPlusBtn    = null;
     }
 
     // ── Error banner ───────────────────────────────────────────────
@@ -759,8 +1229,11 @@ function createFactory() {
                 includeNoteBounds: true,   // needed for boundsLookup marker
             },
             display: {
-                layoutMode:   alphaTab.LayoutMode.Page,
-                scale:        0.9,
+                // Read the pill's persisted layout/zoom prefs at init time.
+                layoutMode:   _svLayoutIsHoriz
+                    ? alphaTab.LayoutMode.Horizontal
+                    : alphaTab.LayoutMode.Page,
+                scale:        _svScale,
                 staveProfile: alphaTab.StaveProfile
                     ? alphaTab.StaveProfile.Score
                     : 2,   // Score-only: no tablature staff
@@ -1072,6 +1545,7 @@ function createFactory() {
     // ── Teardown ───────────────────────────────────────────────────
 
     function _svTeardown(restoreCanvas) {
+        if (_svMarkerRefreshTimer) { clearInterval(_svMarkerRefreshTimer); _svMarkerRefreshTimer = null; }
         _svApiReady      = false;
         _svLastTick      = -1;
         _svLastBeat      = null;
