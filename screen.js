@@ -733,6 +733,7 @@ function _loadAlphaTab() {
 // (NOT a CSS-only heuristic), so it can never affect other vizs; the move
 // itself is one injected CSS rule. HUD only exists in v3, so v2/SS no-op.
 const _svNotationShowing  = new Set();   // instances currently showing notation
+const _svStudyShowing     = new Set();   // instances currently in study mode
 let   _svHudStyleInjected = false;
 
 function _svEnsureHudStyle() {
@@ -745,8 +746,30 @@ function _svEnsureHudStyle() {
     // of the grand staff and above the player controls.
     s.textContent =
         'html.staffview-notation-active #v3-live-performance-hud{' +
-        'position:fixed;top:auto;bottom:96px;right:16px;left:auto;z-index:30;}';
+        'position:fixed;top:auto;bottom:96px;right:16px;left:auto;z-index:30;}' +
+        // Study is guided practice, not a scored take — the live scoreboard is
+        // meaningless there (a step-by-step run is always ~100%) and study
+        // doesn't feed it, so hide it entirely while study mode is active.
+        'html.staffview-study-active #v3-live-performance-hud{display:none!important;}';
     document.head.appendChild(s);
+}
+
+// Toggle the study-active class (hides the core HUD, see _svEnsureHudStyle).
+// Mirrors _svSetNotationShowing: ref-counted across instances, v3-only.
+function _svSetStudyActive(instance, on) {
+    if (on) {
+        if (!_isV3()) return;
+        _svStudyShowing.add(instance);
+    } else {
+        _svStudyShowing.delete(instance);
+    }
+    const cls = document.documentElement.classList;
+    if (_svStudyShowing.size > 0) {
+        _svEnsureHudStyle();
+        cls.add('staffview-study-active');
+    } else {
+        cls.remove('staffview-study-active');
+    }
 }
 
 // Remove our injected per-hand line from core's HUD so it never lingers
@@ -3514,6 +3537,10 @@ function createFactory() {
     // our note-detection domain reporting (PR4a) is invisible to core's
     // HUD/dashboard/song_stats — the two systems are otherwise unconnected.
     function _svEmitNoteResult(hit, note) {
+        // Study mode is unscored practice — never feed core's HUD / song_stats
+        // from it (a step-by-step run is always ~100% and would pollute the
+        // dashboard). Belt-and-suspenders: the study handler already omits this.
+        if (_svStudyMode) return;
         if (window.feedBack && typeof window.feedBack.emit === 'function') {
             // Core's HUD keys off detail.noteTime to drop judgments at/after the
             // seek position on a backward-seek rebuild — an empty payload can
@@ -3567,7 +3594,9 @@ function createFactory() {
         if (!el) return;
         const twoStaff = _svJudgeNotesRH && _svJudgeNotesRH.length
                       && _svJudgeNotesLH && _svJudgeNotesLH.length;
-        if (!twoStaff || (_svHits + _svMisses) <= 0) {
+        // Never show per-hand accuracy in study — it's ~always 100% there and
+        // the whole HUD is hidden anyway (see _svSetStudyActive).
+        if (_svStudyMode || !twoStaff || (_svHits + _svMisses) <= 0) {
             el.style.display = 'none';
             return;
         }
@@ -3682,9 +3711,13 @@ function createFactory() {
         const ctx = _svMissCanvas.getContext('2d');
         if (!ctx) return;
         ctx.clearRect(0, 0, _svMissCanvas.width, _svMissCanvas.height);
-        for (const key of _svMissNotes.keys()) {
-            const entry = _svMissNotes.get(key);
-            if (entry) _svDrawMissDot(ctx, entry);
+        // Free-play red miss-dots are suppressed in study — study shows only
+        // its own orange wrong-note X marks below.
+        if (!_svStudyMode) {
+            for (const key of _svMissNotes.keys()) {
+                const entry = _svMissNotes.get(key);
+                if (entry) _svDrawMissDot(ctx, entry);
+            }
         }
         if (_svStudyMode) {
             for (const [gateIdx, midiSet] of _svStudyWrongAttempts) {
@@ -3752,6 +3785,10 @@ function createFactory() {
     function _svSweepMisses(currentTime) {
         if (!_svMissCanvas || !_svJudgeNotesAll || !_svJudgeNotesAll.length) return;
         if (currentTime === null || currentTime < 0) return;
+        // Study mode has its own gate accounting + seek handler and doesn't
+        // score — the free-play time-sweep (and its _svHandleSeek rollback)
+        // must not run here, or a study seek-back corrupts the free-play tally.
+        if (_svStudyMode) return;
         // Any jump >0.5s in EITHER direction is a seek, not natural playback
         // (which advances well under 0.5s per frame). Re-sync the sweep index
         // to the new position without marking the jumped-over region: a forward
@@ -3985,34 +4022,23 @@ function createFactory() {
         if (_svStudyGateIdx >= _svStudyGates.length) return;
         const entries = _svStudyGetBeatEntries();
         const hit = _svStudyMarkGateHit(entries, _svStudyChordHit, midi);
+        // Study is guided practice, not a scored take: it advances the gate and
+        // reports to the note-detection domain for observability, but does NOT
+        // touch the free-play tallies (_svHits/_svMisses/per-hand), claim notes
+        // in the sweep sets, or emit note:hit/miss to core's scoreboard. That
+        // keeps the free-play counters frozen across a study session (a
+        // step-by-step run is always ~100% and would only pollute song_stats),
+        // and — with the sweep guarded out of study — needs none of that state.
         if (hit.length) {
             // One note-on can clear several charted noteheads (unison /
-            // octave-double / both-hands same beat). Each notehead is one
-            // scored event — count per-entry so hits stay symmetric with the
-            // per-notehead miss-sweep, or unison gates undercount hits.
-            // _svNdReport stays per physical press (one detected pitch).
-            let clearedDot = false;
-            for (const n of hit) {
-                _svHitNoteKeys.add(n.noteKey);
-                if (_svMissNotes.has(n.noteKey)) { _svMissNotes.delete(n.noteKey); clearedDot = true; }
-                _svHits++;
-                if (n.hand === 0) _svHitsRH++; else _svHitsLH++;
-                _svStreak++;
-                if (_svStreak > _svBestStreak) _svBestStreak = _svStreak;
-                _svEmitNoteResult(true);
-            }
-            if (clearedDot) _svRedrawAllMissDots();
-            _svUpdateScoreBadge();
+            // octave-double / both-hands same beat); _svStudyMarkGateHit has
+            // already marked them all. _svNdReport is per physical press.
             _svNdReport(true, midi, _svNdBindingId);
             if (_svStudyGateComplete(entries, _svStudyChordHit)) {
                 _svStudyAdvance();
             }
         } else {
-            _svMisses++;
-            _svStreak = 0;
-            _svUpdateScoreBadge();
             _svNdReport(false, midi, _svNdBindingId);
-            _svEmitNoteResult(false);
             if (!_svStudyWrongAttempts.has(_svStudyGateIdx))
                 _svStudyWrongAttempts.set(_svStudyGateIdx, new Set());
             // Sequential wrong attempts replace each other; simultaneous wrong
@@ -4131,6 +4157,7 @@ function createFactory() {
         }
         _svStudyAttachSeekHandler();
         _svStudySnapCursor();
+        _svSetStudyActive(instance, true);   // hide core's live HUD in study
         _svUpdateStudyBtn();
     }
 
@@ -4144,6 +4171,7 @@ function createFactory() {
         _svStudyMode     = false;
         _svStudyChordHit.clear();
         _svStudyWrongAttempts.clear();
+        _svSetStudyActive(instance, false);   // restore core's live HUD
         _svRedrawAllMissDots();
         _svUpdateStudyBtn();
     }
@@ -4244,6 +4272,7 @@ function createFactory() {
             _svStudyCountdownId  = null;
         }
         _svStudyDetachSeekHandler();
+        _svSetStudyActive(instance, false);   // restore core's HUD if torn down mid-study
         _svStudyMode         = false;
         _svStudyCountingDown = false;
         _svStudyGates        = [];
