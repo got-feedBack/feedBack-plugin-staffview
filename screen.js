@@ -3049,26 +3049,50 @@ function createFactory() {
     // gate. Correct notes accumulate until the chord is complete (→ advance);
     // wrong notes draw an X and count as a miss. Feeds the same core stats /
     // note-detection channels as free-play judging.
+    // Register one physical note-on against a study gate. A single key press
+    // clears EVERY charted note at that pitch: unison, octave-doubling and
+    // both-hands same-beat collapse each yield multiple entries with equal
+    // midi, yet there is only one note-on. Marking just the first would leave
+    // the duplicate unsatisfied and freeze the gate forever. Mutates `hitKeys`;
+    // returns the entries newly hit (empty ⇒ wrong note).
+    function _svStudyMarkGateHit(entries, hitKeys, midi) {
+        const hit = [];
+        for (const n of entries) {
+            if (n.midi === midi && !hitKeys.has(n.noteKey)) { hitKeys.add(n.noteKey); hit.push(n); }
+        }
+        return hit;
+    }
+
+    // Gate is complete once every charted entry has been hit.
+    function _svStudyGateComplete(entries, hitKeys) {
+        return entries.every(n => hitKeys.has(n.noteKey));
+    }
+
     function _svStudyHandleNoteOn(midi) {
         if (_svStudyCountingDown) return;
         if (_svStudyGateIdx >= _svStudyGates.length) return;
         const entries = _svStudyGetBeatEntries();
-        const matched = entries.find(n => n.midi === midi && !_svStudyChordHit.has(n.noteKey));
-        if (matched) {
-            _svStudyChordHit.add(matched.noteKey);
-            _svHitNoteKeys.add(matched.noteKey);
-            _svHits++;
-            if (matched.hand === 0) _svHitsRH++; else _svHitsLH++;
-            _svStreak++;
-            if (_svStreak > _svBestStreak) _svBestStreak = _svStreak;
-            if (_svMissNotes.has(matched.noteKey)) {
-                _svMissNotes.delete(matched.noteKey);
-                _svRedrawAllMissDots();
+        const hit = _svStudyMarkGateHit(entries, _svStudyChordHit, midi);
+        if (hit.length) {
+            // One note-on can clear several charted noteheads (unison /
+            // octave-double / both-hands same beat). Each notehead is one
+            // scored event — count per-entry so hits stay symmetric with the
+            // per-notehead miss-sweep, or unison gates undercount hits.
+            // _svNdReport stays per physical press (one detected pitch).
+            let clearedDot = false;
+            for (const n of hit) {
+                _svHitNoteKeys.add(n.noteKey);
+                if (_svMissNotes.has(n.noteKey)) { _svMissNotes.delete(n.noteKey); clearedDot = true; }
+                _svHits++;
+                if (n.hand === 0) _svHitsRH++; else _svHitsLH++;
+                _svStreak++;
+                if (_svStreak > _svBestStreak) _svBestStreak = _svStreak;
+                _svEmitNoteResult(true);
             }
+            if (clearedDot) _svRedrawAllMissDots();
             _svUpdateScoreBadge();
             _svNdReport(true, midi, _svNdBindingId);
-            _svEmitNoteResult(true);
-            if (entries.every(n => _svStudyChordHit.has(n.noteKey))) {
+            if (_svStudyGateComplete(entries, _svStudyChordHit)) {
                 _svStudyAdvance();
             }
         } else {

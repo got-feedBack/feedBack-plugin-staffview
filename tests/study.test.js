@@ -25,11 +25,15 @@ function grab(re, label) {
     return m[0];
 }
 const fnSrc = grab(/function _svMidiToDiatonic\(midi\) \{[\s\S]*?\n    \}/, '_svMidiToDiatonic');
+const markSrc = grab(/function _svStudyMarkGateHit\(entries, hitKeys, midi\) \{[\s\S]*?\n    \}/, '_svStudyMarkGateHit');
+const completeSrc = grab(/function _svStudyGateComplete\(entries, hitKeys\) \{[\s\S]*?\n    \}/, '_svStudyGateComplete');
 
 function load() {
-    return new Function('"use strict";' + fnSrc + '\nreturn { _svMidiToDiatonic };')();
+    return new Function('"use strict";'
+        + fnSrc + '\n' + markSrc + '\n' + completeSrc
+        + '\nreturn { _svMidiToDiatonic, _svStudyMarkGateHit, _svStudyGateComplete };')();
 }
-const { _svMidiToDiatonic } = load();
+const { _svMidiToDiatonic, _svStudyMarkGateHit, _svStudyGateComplete } = load();
 
 // ── _svMidiToDiatonic ────────────────────────────────────────────────────────
 
@@ -47,4 +51,35 @@ test('_svMidiToDiatonic ignores accidentals (C4 and C#4 share a step)', () => {
 test('_svMidiToDiatonic advances 7 steps per octave', () => {
     assert.equal(_svMidiToDiatonic(72) - _svMidiToDiatonic(60), 7);   // C5 − C4
     assert.equal(_svMidiToDiatonic(48) - _svMidiToDiatonic(60), -7);  // C3 − C4
+});
+
+// ── study gate: unison / duplicate-midi does not freeze ──────────────────────
+// Two entries can share one midi (unison, octave-doubling, both-hands same-beat
+// collapse). One physical key press is a single note-on — it must satisfy every
+// same-midi entry, or the gate hangs forever (the review-flagged freeze).
+
+test('_svStudyMarkGateHit clears every entry at the played pitch on one note-on', () => {
+    // Unison: two distinct noteheads, same midi.
+    const entries = [
+        { midi: 60, noteKey: 'a', hand: 0 },
+        { midi: 60, noteKey: 'b', hand: 1 },
+    ];
+    const hitKeys = new Set();
+    const hit = _svStudyMarkGateHit(entries, hitKeys, 60);
+    assert.equal(hit.length, 2, 'one note-on marks both same-midi entries');
+    assert.ok(_svStudyGateComplete(entries, hitKeys), 'gate completes — no freeze');
+});
+
+test('_svStudyMarkGateHit leaves the gate open on a wrong / partial note-on', () => {
+    const entries = [
+        { midi: 60, noteKey: 'a', hand: 0 },
+        { midi: 64, noteKey: 'b', hand: 0 },
+    ];
+    const hitKeys = new Set();
+    assert.equal(_svStudyMarkGateHit(entries, hitKeys, 62).length, 0, 'wrong pitch matches nothing');
+    assert.ok(!_svStudyGateComplete(entries, hitKeys), 'gate still open');
+    _svStudyMarkGateHit(entries, hitKeys, 60);
+    assert.ok(!_svStudyGateComplete(entries, hitKeys), 'still open — 64 not yet played');
+    _svStudyMarkGateHit(entries, hitKeys, 64);
+    assert.ok(_svStudyGateComplete(entries, hitKeys), 'both distinct pitches played → complete');
 });
