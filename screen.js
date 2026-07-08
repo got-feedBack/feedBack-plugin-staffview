@@ -1264,7 +1264,6 @@ function createFactory() {
     let _svStudyMode         = false;
     let _svStudyGates        = [];     // [{gateTime, entries[]}] sorted by gateTime
     let _svStudyGateIdx      = 0;      // index of the current gate
-    let _svStudyGateTime     = null;   // OGG seconds at which to pause; null = none
     const _svStudyChordHit   = new Set();   // noteKeys satisfied at the current gate
     let _svStudyBtnEl        = null;
     let _svStudyCountingDown = false;
@@ -1288,8 +1287,7 @@ function createFactory() {
     let _svMissCanvas    = null;
     let _svMissSweepIdx  = 0;
     let _svLastSweepTime = -1;   // for backward-seek detection
-    const _svMissNotes      = new Set();   // noteKeys of swept-miss notes
-    const _svMissEntryByKey = new Map();   // noteKey → judge-list entry
+    const _svMissNotes      = new Map();   // noteKey → judge-list entry of swept-miss notes
 
     // ── Note-detection binding (this instance's chart-scoped context) ──
     let _svNdBindingId = null;
@@ -3445,8 +3443,6 @@ function createFactory() {
         _svJudgeNotesAll = all;
         _svJudgeNotesRH  = rh;
         _svJudgeNotesLH  = lh;
-        _svMissEntryByKey.clear();
-        for (const e of all) _svMissEntryByKey.set(e.noteKey, e);
         // Clean slate; also re-syncs the sweep past the current playback time
         // so notes already in the past when the chart loads are never
         // retroactively missed.
@@ -3683,8 +3679,8 @@ function createFactory() {
         const ctx = _svMissCanvas.getContext('2d');
         if (!ctx) return;
         ctx.clearRect(0, 0, _svMissCanvas.width, _svMissCanvas.height);
-        for (const key of _svMissNotes) {
-            const entry = _svMissEntryByKey.get(key);
+        for (const key of _svMissNotes.keys()) {
+            const entry = _svMissNotes.get(key);
             if (entry) _svDrawMissDot(ctx, entry);
         }
         if (_svStudyMode) {
@@ -3710,8 +3706,8 @@ function createFactory() {
         // and their counts both persist (the sweep won't re-count a note still
         // in _svMissNotes). hand 0 = RH; guard against negative on double-seek.
         if (_svClearOnSeek) {
-            for (const key of _svMissNotes) {
-                const entry = _svMissEntryByKey.get(key);
+            for (const key of _svMissNotes.keys()) {
+                const entry = _svMissNotes.get(key);
                 if (entry && entry.t >= newTime) {
                     _svMissNotes.delete(key);
                     _svMisses = Math.max(0, _svMisses - 1);
@@ -3782,7 +3778,7 @@ function createFactory() {
             if (_svActiveHands !== 'both'
                     && n.hand !== (_svActiveHands === 'rh' ? 0 : 1)) continue;
             if (!_svHitNoteKeys.has(n.noteKey) && !_svMissNotes.has(n.noteKey)) {
-                _svMissNotes.add(n.noteKey);
+                _svMissNotes.set(n.noteKey, n);
                 if (ctx) _svDrawMissDot(ctx, n);
                 if (n.hand === 0) _svMissesRH++; else _svMissesLH++;
                 _svMisses++;
@@ -3846,8 +3842,6 @@ function createFactory() {
                    _svStudyGates[_svStudyGateIdx].gateTime < tNow) {
                 _svStudyGateIdx++;
             }
-            _svStudyGateTime = _svStudyGateIdx < _svStudyGates.length
-                ? _svStudyGates[_svStudyGateIdx].gateTime : null;
             _svStudySnapCursor();
         }
         _svUpdateHandButtons();
@@ -3946,8 +3940,6 @@ function createFactory() {
         _svRedrawAllMissDots();
         _svStudyChordHit.clear();
         _svStudyGateIdx++;
-        _svStudyGateTime = _svStudyGateIdx < _svStudyGates.length
-            ? _svStudyGates[_svStudyGateIdx].gateTime : null;
         _svStudySnapCursor();
         _svPrerollResuming = true;   // gate advance — no preroll on resume
         try {
@@ -4098,8 +4090,6 @@ function createFactory() {
                    _svStudyGates[_svStudyGateIdx].gateTime < t) {
                 _svStudyGateIdx++;
             }
-            _svStudyGateTime = _svStudyGateIdx < _svStudyGates.length
-                ? _svStudyGates[_svStudyGateIdx].gateTime : null;
             _svStudyChordHit.clear();
             _svStudyWrongAttempts.clear();
             _svRedrawAllMissDots();
@@ -4129,8 +4119,6 @@ function createFactory() {
                _svStudyGates[_svStudyGateIdx].gateTime < t) {
             _svStudyGateIdx++;
         }
-        _svStudyGateTime = _svStudyGateIdx < _svStudyGates.length
-            ? _svStudyGates[_svStudyGateIdx].gateTime : null;
         _svStudyAttachSeekHandler();
         _svStudySnapCursor();
         _svUpdateStudyBtn();
@@ -4144,7 +4132,6 @@ function createFactory() {
         }
         _svStudyDetachSeekHandler();
         _svStudyMode     = false;
-        _svStudyGateTime = null;
         _svStudyChordHit.clear();
         _svStudyWrongAttempts.clear();
         _svRedrawAllMissDots();
@@ -4251,7 +4238,6 @@ function createFactory() {
         _svStudyCountingDown = false;
         _svStudyGates        = [];
         _svStudyGateIdx      = 0;
-        _svStudyGateTime     = null;
         _svStudyChordHit.clear();
         _svStudyWrongAttempts.clear();
         _svPrerollResuming   = false;
@@ -4283,7 +4269,6 @@ function createFactory() {
         // Reset miss-dot sweep state (the canvas itself goes with the
         // container in _svRemoveContainer below).
         _svMissNotes.clear();
-        _svMissEntryByKey.clear();
         _svMissSweepIdx  = 0;
         _svLastSweepTime = -1;
         // Cancel any in-flight drag gesture.
@@ -4447,9 +4432,9 @@ function createFactory() {
                         }
                         _svPrerollResuming = false;
                     }
+                    const _g = _svStudyGates[_svStudyGateIdx];
                     if (_svStudyMode && !_svStudyCountingDown && !audio.paused
-                            && _svStudyGateTime !== null
-                            && audio.currentTime >= _svStudyGateTime) {
+                            && _g && audio.currentTime >= _g.gateTime) {
                         audio.pause();
                     }
                     _svWasAudioPaused = audio.paused;
