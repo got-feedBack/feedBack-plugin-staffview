@@ -6,6 +6,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Cursor now advances on bass-only (left-hand) beats** — `_svBuildBeatTimeline`
+  previously walked only the first staff of the first track, so beats that
+  only existed on the bass staff were missing from the tick index and the
+  playback cursor would stall or skip during left-hand-only passages. It now
+  collects beats from all staves of the first track and dedupes by tick
+  (treble preferred at shared positions).
+- **Final beat of a song is now reachable** — `_svSyncCursor`'s binary search
+  capped `hi` at `beats.length - 2`, making the last beat unreachable by the
+  search; it's now `beats.length - 1`.
+
+---
+
 ## [0.3.0] — 2026-07-08
 
 ### Added

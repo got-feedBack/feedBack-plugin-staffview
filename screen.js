@@ -3201,15 +3201,16 @@ function createFactory() {
     }
 
     // ── Beat timeline (tick → Beat lookup) ────────────────────────
-    // Walks score.tracks[0].staves[0] only — the first staff of the
-    // first track is sufficient to build the absolute-tick index used
-    // for cursor sync.
+    // Collects beats from ALL staves of the first track so bass-only
+    // positions aren't skipped during cursor lookup, then dedupes by
+    // tick (treble preferred at shared positions).
 
     function _svBuildBeatTimeline(score) {
         const out = [];
         try {
-            trackLoop: for (const track of (score.tracks || [])) {
-                for (const staff of (track.staves || [])) {
+            const tracks = score.tracks || [];
+            if (tracks.length) {
+                for (const staff of (tracks[0].staves || [])) {
                     for (const bar of (staff.bars || [])) {
                         for (const voice of (bar.voices || [])) {
                             for (const beat of (voice.beats || [])) {
@@ -3222,12 +3223,22 @@ function createFactory() {
                             }
                         }
                     }
-                    break trackLoop; // first staff per track is sufficient; also exits trackLoop
                 }
             }
         } catch (_) {}
         out.sort((a, b) => a.start - b.start);
-        return out;
+        // Dedupe by tick: keep the first entry at each start tick so
+        // treble beats win when both staves share the same position
+        // (staff 0's beats are pushed first and sort is stable).
+        const deduped = [];
+        let prevStart = -1;
+        for (const entry of out) {
+            if (entry.start !== prevStart) {
+                deduped.push(entry);
+                prevStart = entry.start;
+            }
+        }
+        return deduped;
     }
 
     function _svFindBeatAtTick(tick) {
@@ -3287,7 +3298,7 @@ function createFactory() {
 
         // Binary search: largest i where beats[i].time <= currentTime.
         if (currentTime < beats[0].time) return;
-        let lo = 0, hi = beats.length - 2, idx = 0;
+        let lo = 0, hi = beats.length - 1, idx = 0;
         while (lo <= hi) {
             const mid = (lo + hi) >> 1;
             if (beats[mid].time <= currentTime) { idx = mid; lo = mid + 1; }
