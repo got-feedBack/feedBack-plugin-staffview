@@ -6,7 +6,10 @@
  * during normal (non-study) playback, accented on downbeats (measure >= 0).
  * _svMetroBeatIdx tracks the last index a click fired for, so an ordinary
  * one-beat advance clicks while a seek/jump (or backwards move) just
- * resyncs silently — mirrors _svSyncCursor's binary search.
+ * resyncs silently — mirrors _svSyncCursor's binary search. A platform
+ * 'seeked' event (even an exact +1 beat) sets _svMetroSeekResync so the
+ * next tick resyncs without clicking. Only the focused panel (_svIsFocused)
+ * reacts, since #audio is shared across split-screen instances.
  *
  * _svMetroTick closes over several module-level free variables
  * (_svMetronomeOn, _svStudyMode, _svLatestBeats, _svMetroBeatIdx,
@@ -36,11 +39,14 @@ function load() {
     return new Function(`
         let _svMetronomeOn  = true;
         let _svStudyMode    = false;
+        let _svIsFocused    = true;
         let _svLatestBeats  = null;
         let _svMetroBeatIdx = -1;
+        let _svMetroSeekResync = false;
         let _beeps = [];
         let _audio = { paused: false };
         function _svStudyBeep(accent) { _beeps.push(accent); }
+        function _svMetroAttachSeekHandler() {}   // real attach mechanics not under test here
         const document = { getElementById: () => _audio };
 
         ${fnSrc}
@@ -49,10 +55,13 @@ function load() {
             tick: (t) => _svMetroTick(t),
             setMetro: (v) => { _svMetronomeOn = v; },
             setStudy: (v) => { _svStudyMode = v; },
+            setFocused: (v) => { _svIsFocused = v; },
             setBeats: (b) => { _svLatestBeats = b; },
             setAudio: (a) => { _audio = a; },
+            setSeekResync: (v) => { _svMetroSeekResync = v; },
             getIdx: () => _svMetroBeatIdx,
             getBeeps: () => _beeps.slice(),
+            getSeekResync: () => _svMetroSeekResync,
         };
     `)();
 }
@@ -136,4 +145,47 @@ test('_svMetroTick is silent with fewer than 2 beats', () => {
     h.setBeats([{ time: 0, measure: 0 }]);
     h.tick(0.0);
     assert.deepEqual(h.getBeeps(), []);
+});
+
+test('_svMetroTick is silent and does not advance when this panel is unfocused', () => {
+    const h = load();
+    h.setBeats(BEATS);
+    h.setFocused(false);
+    h.tick(0.0);
+    assert.deepEqual(h.getBeeps(), [], 'unfocused panel never clicks');
+    assert.equal(h.getIdx(), -1, 'unfocused panel does not advance its beat index');
+});
+
+test('_svMetroTick resyncs silently on a seeked +1-beat advance instead of clicking', () => {
+    const h = load();
+    h.setBeats(BEATS);
+    h.tick(0.0);          // idx 0, one click
+    h.setSeekResync(true);   // simulate the 'seeked' handler firing
+    h.tick(0.5);           // exact +1 beat — would normally click
+    assert.deepEqual(h.getBeeps(), [true], 'resync suppresses the click');
+    assert.equal(h.getIdx(), 1, 'index still resyncs to the current beat');
+    assert.equal(h.getSeekResync(), false, 'resync flag is cleared after use');
+});
+
+test('_svMetroTick resyncs silently on a seeked backward move', () => {
+    const h = load();
+    h.setBeats(BEATS);
+    h.tick(0.0);
+    h.tick(0.5);           // idx 1
+    h.setSeekResync(true);
+    h.tick(0.0);           // seek backward
+    assert.deepEqual(h.getBeeps(), [true, false], 'backward seek adds no further click');
+    assert.equal(h.getIdx(), 0, 'index resyncs to the seeked-to beat');
+    assert.equal(h.getSeekResync(), false, 'resync flag is cleared after use');
+});
+
+test('_svMetroTick clicks again on the next natural advance after a resync', () => {
+    const h = load();
+    h.setBeats(BEATS);
+    h.tick(0.0);           // idx 0, one click
+    h.setSeekResync(true);
+    h.tick(0.5);           // resync, no click, idx -> 1
+    h.tick(1.0);           // ordinary +1 advance after the resync
+    assert.deepEqual(h.getBeeps(), [true, false], 'natural advance beeps again');
+    assert.equal(h.getIdx(), 2);
 });

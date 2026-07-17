@@ -1289,6 +1289,9 @@ function createFactory() {
     let _svMetronomeOn  = _svReadStore(_SV_STORE_METRONOME) === '1';
     let _svMetroBeatIdx = -1;
     let _svMetroBtnEl   = null;
+    let _svMetroSeekResync = false;   // set on audio 'seeked'; next tick resyncs
+                                       // without clicking — also covers A/B loop wraps
+    let _svMetroSeekHandler = null;   // 'seeked' listener for platform seeks
 
     // ── Study mode ──────────────────────────────────────────────────
     // Note-by-note gated practice: the OGG pauses at each gate (a beat's
@@ -3371,14 +3374,17 @@ function createFactory() {
     // opening a second audio path. Study mode has its own preroll clicks,
     // so this stays silent there regardless of the toggle. Same binary-
     // search-over-bundle.beats pattern as _svSyncCursor; _svMetroBeatIdx
-    // tracks the last index a click fired for so a seek/jump (index moves
-    // by more than one, or backwards) resyncs silently instead of clicking.
+    // tracks the last index a click fired for. A platform seek (even an
+    // exact +1 beat) sets _svMetroSeekResync via _svMetroAttachSeekHandler,
+    // so the next tick resyncs silently instead of clicking.
     function _svMetroTick(currentTime) {
+        if (!_svIsFocused) return;   // shared #audio: only the focused panel reacts
         if (!_svMetronomeOn || _svStudyMode) return;
         const beats = _svLatestBeats;
         if (!beats || beats.length < 2) return;
         const audio = document.getElementById('audio');
         if (!audio || audio.paused) return;
+        _svMetroAttachSeekHandler();
 
         if (currentTime < beats[0].time) { _svMetroBeatIdx = -1; return; }
 
@@ -3390,9 +3396,29 @@ function createFactory() {
             else { hi = mid - 1; }
         }
 
+        if (_svMetroSeekResync) { _svMetroSeekResync = false; _svMetroBeatIdx = i; return; }
         if (i === _svMetroBeatIdx) return;
         if (i === _svMetroBeatIdx + 1) _svStudyBeep(beats[i].measure >= 0);
         _svMetroBeatIdx = i;
+    }
+
+    // A platform-initiated seek (scrub bar, A/B loop wrap) while the metronome
+    // is on: flag the next tick to resync silently instead of clicking.
+    // Mirrors _svStudyAttachSeekHandler/_svStudyDetachSeekHandler.
+    function _svMetroAttachSeekHandler() {
+        const audio = document.getElementById('audio');
+        if (!audio || _svMetroSeekHandler) return;
+        _svMetroSeekHandler = function () { _svMetroSeekResync = true; };
+        audio.addEventListener('seeked', _svMetroSeekHandler);
+    }
+
+    function _svMetroDetachSeekHandler() {
+        if (!_svMetroSeekHandler) return;
+        try {
+            const audio = document.getElementById('audio');
+            if (audio) audio.removeEventListener('seeked', _svMetroSeekHandler);
+        } catch (_) {}
+        _svMetroSeekHandler = null;
     }
 
     // ── Playback marker (boundsLookup-driven, slopsmith#734) ────────
@@ -4396,6 +4422,8 @@ function createFactory() {
         _svApiReady      = false;
         _svLastTick      = -1;
         _svMetroBeatIdx  = -1;
+        _svMetroDetachSeekHandler();
+        _svMetroSeekResync = false;
         _svLastBeat      = null;
         _svAtBeats       = [];
         _svLatestBeats   = null;
