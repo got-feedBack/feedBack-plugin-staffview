@@ -8,6 +8,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Metronome** — a `METRONOME` toggle in the options pill clicks on every
+  beat during normal playback (accented on downbeats), reusing the existing
+  `_svStudyBeep` click and its lazily-recreated `AudioContext` rather than
+  opening a second audio path. Study mode is excluded — it already has its
+  own preroll count-in clicks. Persisted to `localStorage`.
+
 ### Fixed
 
 - **Cursor now advances on bass-only (left-hand) beats** — `_svBuildBeatTimeline`

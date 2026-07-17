@@ -94,6 +94,7 @@ const _SV_STORE_SYNTH_VOL  = 'staffview_synth_vol';
 const _SV_STORE_PREROLL    = 'staffview_preroll';
 const _SV_STORE_DETECT        = 'staffview_detect';
 const _SV_STORE_CLEAR_ON_SEEK = 'staffview_clear_on_seek';
+const _SV_STORE_METRONOME     = 'staffview_metronome';
 
 // ═══════════════════════════════════════════════════════════════════════
 // Module-level singletons
@@ -1281,6 +1282,17 @@ function createFactory() {
     let _svClearOnSeek   = _svReadStore(_SV_STORE_CLEAR_ON_SEEK) !== 'false';
     let _svDetectBtnEl   = null;
 
+    // Metronome click during normal (non-study) playback, persisted.
+    // _svMetroBeatIdx tracks the last bundle.beats index a click fired for,
+    // so _svMetroTick can tell "advanced one beat" (click) from "seeked"
+    // (resync silently) — mirrors _svLastTick's role for the cursor.
+    let _svMetronomeOn  = _svReadStore(_SV_STORE_METRONOME) === '1';
+    let _svMetroBeatIdx = -1;
+    let _svMetroBtnEl   = null;
+    let _svMetroSeekResync = false;   // set on audio 'seeked'; next tick resyncs
+                                       // without clicking — also covers A/B loop wraps
+    let _svMetroSeekHandler = null;   // 'seeked' listener for platform seeks
+
     // ── Study mode ──────────────────────────────────────────────────
     // Note-by-note gated practice: the OGG pauses at each gate (a beat's
     // required notes) and only resumes once they are all played on MIDI.
@@ -2397,6 +2409,38 @@ function createFactory() {
         ndSection.appendChild(ndRow);
         ndSection.appendChild(clearRow);
 
+        // ── METRONOME section ───────────────────────────────────────
+        // Beat click during normal playback (study mode has its own preroll
+        // clicks, so this stays off there regardless of the toggle).
+        const metroSection = document.createElement('div');
+        metroSection.style.cssText =
+            'margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px';
+
+        const metroLabel = document.createElement('span');
+        metroLabel.className = 'section-practice-label';
+        metroLabel.textContent = 'METRONOME';
+
+        const metroRow = document.createElement('div');
+        metroRow.className = 'section-practice-controls-row';
+        metroRow.style.marginTop = '4px';
+
+        const metroBtn = document.createElement('button');
+        metroBtn.type = 'button';
+        metroBtn.title = 'Click on every beat during playback (accented on downbeats)';
+        metroBtn.className = btnCls;
+        metroBtn.addEventListener('click', () => {
+            _svMetronomeOn = !_svMetronomeOn;
+            _svSaveStore(_SV_STORE_METRONOME, _svMetronomeOn ? '1' : '0');
+            _svMetroBeatIdx = -1;
+            _svUpdateMetroBtn();
+        });
+        _svMetroBtnEl = metroBtn;
+        _svUpdateMetroBtn();   // set label/visual from current state
+        metroRow.appendChild(metroBtn);
+
+        metroSection.appendChild(metroLabel);
+        metroSection.appendChild(metroRow);
+
         // ── MIDI section ───────────────────────────────────────────
         // Device + channel picker. Always visible (not gated on a loaded
         // chart) so the user can set up their device ahead of time. The
@@ -2734,8 +2778,9 @@ function createFactory() {
         studySection.appendChild(prerollRow);
 
         // Section order mirrors the legacy pill:
-        // NOTE DETECTION → STUDY → HAND → MIDI (+ Sound + Volume) → LAYOUT → ZOOM.
+        // NOTE DETECTION → METRONOME → STUDY → HAND → MIDI (+ Sound + Volume) → LAYOUT → ZOOM.
         popover.appendChild(ndSection);
+        popover.appendChild(metroSection);
         popover.appendChild(studySection);
         popover.appendChild(handSection);
         popover.appendChild(midiSection);
@@ -3322,6 +3367,58 @@ function createFactory() {
         _svLastTick = tick;
         _svLastBeat = _svFindBeatAtTick(tick);
         _svUpdateMarker();
+    }
+
+    // ── Metronome click (normal playback only) ──────────────────────
+    // Reuses _svStudyBeep (own lazily-recreated AudioContext) instead of
+    // opening a second audio path. Study mode has its own preroll clicks,
+    // so this stays silent there regardless of the toggle. Same binary-
+    // search-over-bundle.beats pattern as _svSyncCursor; _svMetroBeatIdx
+    // tracks the last index a click fired for. A platform seek (even an
+    // exact +1 beat) sets _svMetroSeekResync via _svMetroAttachSeekHandler,
+    // so the next tick resyncs silently instead of clicking.
+    function _svMetroTick(currentTime) {
+        if (!_svIsFocused) return;   // shared #audio: only the focused panel reacts
+        if (!_svMetronomeOn || _svStudyMode) return;
+        const beats = _svLatestBeats;
+        if (!beats || beats.length < 2) return;
+        const audio = document.getElementById('audio');
+        if (!audio || audio.paused) return;
+        _svMetroAttachSeekHandler();
+
+        if (currentTime < beats[0].time) { _svMetroBeatIdx = -1; return; }
+
+        // Binary search: largest i where beats[i].time <= currentTime.
+        let lo = 0, hi = beats.length - 1, i = 0;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (beats[mid].time <= currentTime) { i = mid; lo = mid + 1; }
+            else { hi = mid - 1; }
+        }
+
+        if (_svMetroSeekResync) { _svMetroSeekResync = false; _svMetroBeatIdx = i; return; }
+        if (i === _svMetroBeatIdx) return;
+        if (i === _svMetroBeatIdx + 1) _svStudyBeep(beats[i].measure >= 0);
+        _svMetroBeatIdx = i;
+    }
+
+    // A platform-initiated seek (scrub bar, A/B loop wrap) while the metronome
+    // is on: flag the next tick to resync silently instead of clicking.
+    // Mirrors _svStudyAttachSeekHandler/_svStudyDetachSeekHandler.
+    function _svMetroAttachSeekHandler() {
+        const audio = document.getElementById('audio');
+        if (!audio || _svMetroSeekHandler) return;
+        _svMetroSeekHandler = function () { _svMetroSeekResync = true; };
+        audio.addEventListener('seeked', _svMetroSeekHandler);
+    }
+
+    function _svMetroDetachSeekHandler() {
+        if (!_svMetroSeekHandler) return;
+        try {
+            const audio = document.getElementById('audio');
+            if (audio) audio.removeEventListener('seeked', _svMetroSeekHandler);
+        } catch (_) {}
+        _svMetroSeekHandler = null;
     }
 
     // ── Playback marker (boundsLookup-driven, slopsmith#734) ────────
@@ -4090,6 +4187,13 @@ function createFactory() {
         _svDetectBtnEl.style.boxShadow = _svDetectEnabled ? '0 0 0 1px #22c55e' : '';
     }
 
+    function _svUpdateMetroBtn() {
+        if (!_svMetroBtnEl) return;
+        _svMetroBtnEl.textContent = _svMetronomeOn ? 'Metronome ✓' : 'Metronome';
+        _svMetroBtnEl.style.opacity   = _svMetronomeOn ? '1' : '0.7';
+        _svMetroBtnEl.style.boxShadow = _svMetronomeOn ? '0 0 0 1px #22c55e' : '';
+    }
+
     // A short metronome click for the preroll countdown (own AudioContext,
     // closed on teardown).
     function _svStudyBeep(accent) {
@@ -4317,6 +4421,9 @@ function createFactory() {
         _svLastTapTime = 0;
         _svApiReady      = false;
         _svLastTick      = -1;
+        _svMetroBeatIdx  = -1;
+        _svMetroDetachSeekHandler();
+        _svMetroSeekResync = false;
         _svLastBeat      = null;
         _svAtBeats       = [];
         _svLatestBeats   = null;
@@ -4397,6 +4504,7 @@ function createFactory() {
             _svHighwayCanvas  = canvas;
             _svPrevVisibility = canvas ? canvas.style.visibility : '';
             _svLastTick       = -1;
+            _svMetroBeatIdx   = -1;
 
             window.addEventListener('resize', _onWinResize);
 
@@ -4470,11 +4578,13 @@ function createFactory() {
                 if (_resolveMount(_svHighwayCanvas)) {
                     const myToken = ++_svInitToken;
                     _svLastTick   = -1;
+                    _svMetroBeatIdx = -1;
                     _svConnectAndLoad(filename, arrIdx, myToken);
                 }
             }
 
             _svSyncCursor(bundle.currentTime);
+            _svMetroTick(bundle.currentTime);
             _svSweepMisses(bundle.currentTime);
 
             // Study mode: preroll count-in on manual play, and gate-pause when
