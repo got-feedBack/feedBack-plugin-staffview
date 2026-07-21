@@ -43,6 +43,7 @@ function load() {
         let _svLatestBeats  = null;
         let _svMetroBeatIdx = -1;
         let _svMetroSeekResync = false;
+        let _svMeasures = [];
         let _beeps = [];
         let _audio = { paused: false };
         function _svStudyBeep(accent) { _beeps.push(accent); }
@@ -59,6 +60,7 @@ function load() {
             setBeats: (b) => { _svLatestBeats = b; },
             setAudio: (a) => { _audio = a; },
             setSeekResync: (v) => { _svMetroSeekResync = v; },
+            setMeasures: (m) => { _svMeasures = m; },
             getIdx: () => _svMetroBeatIdx,
             getBeeps: () => _beeps.slice(),
             getSeekResync: () => _svMetroSeekResync,
@@ -177,6 +179,29 @@ test('_svMetroTick resyncs silently on a seeked backward move', () => {
     assert.deepEqual(h.getBeeps(), [true, false], 'backward seek adds no further click');
     assert.equal(h.getIdx(), 0, 'index resyncs to the seeked-to beat');
     assert.equal(h.getSeekResync(), false, 'resync flag is cleared after use');
+});
+
+test('_svMetroTick does not accent the pickup: first accent lands on bar 1', () => {
+    const h = load();
+    // 1-beat pickup labeled measure 0 at t=0, first full bar at t=0.5.
+    h.setBeats([
+        { time: 0.0, measure: 0 },    // pickup start — click, no accent
+        { time: 0.5, measure: 1 },    // first full bar downbeat — accent
+        { time: 1.0, measure: -1 },
+    ]);
+    h.setMeasures([{ idx: 0, pickup: true }]);
+    h.tick(0.0);
+    h.tick(0.5);
+    h.tick(1.0);
+    assert.deepEqual(h.getBeeps(), [false, true, false]);
+});
+
+test('_svMetroTick keeps the first-beat accent when there is no pickup', () => {
+    const h = load();
+    h.setBeats(BEATS);
+    h.setMeasures([{ idx: 0 }]);
+    h.tick(0.0);
+    assert.deepEqual(h.getBeeps(), [true]);
 });
 
 test('_svMetroTick clicks again on the next natural advance after a resync', () => {

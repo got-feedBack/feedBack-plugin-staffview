@@ -13,11 +13,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Metronome** — a `METRONOME` toggle in the options pill clicks on every
   beat during normal playback (accented on downbeats), reusing the existing
   `_svStudyBeep` click and its lazily-recreated `AudioContext` rather than
-  opening a second audio path. Study mode is excluded — it already has its
-  own preroll count-in clicks. Persisted to `localStorage`.
+  opening a second audio path. Study mode is excluded (gate pauses would
+  make the clicks stutter). Persisted to `localStorage`.
+
+### Removed
+
+- **Study-mode preroll count-in** (toggle, countdown, pause→play edge
+  tracking; the `staffview_preroll` localStorage key is orphaned). Core's
+  `countdownBeforeSong` count-in is the single count-in; making it
+  time-signature- and pickup-aware is a follow-up core PR.
 
 ### Fixed
 
+- **Pickup (anacrusis) measures** — the notation JSON's `pickup` flag now
+  maps onto alphaTab's `isAnacrusis`, so measure 0 is sized by content
+  rather than the declared time signature. The metronome no longer accents
+  the pickup's click: it is the tail of an incomplete bar, so the first
+  accent belongs to the first full measure's downbeat.
 - **Cursor now advances on bass-only (left-hand) beats** — `_svBuildBeatTimeline`
   previously walked only the first staff of the first track, so beats that
   only existed on the bass staff were missing from the tick index and the
