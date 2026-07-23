@@ -3455,19 +3455,59 @@ function createFactory() {
         _svMarker.style.height  = height + 'px';
         _svMarker.style.display = '';
 
-        // Auto-scroll to keep the marker in view.
+        // Auto-scroll to keep the marker in view, with 1-row lookahead.
         const viewW = _svContainer.clientWidth;
         const viewH = _svContainer.clientHeight;
         const padX  = Math.min(180, viewW * 0.3);
-        const padY  = Math.min(100, viewH * 0.25);
         const relX  = left  - _svContainer.scrollLeft;
         const relY  = topPx - _svContainer.scrollTop;
 
         let tX = _svContainer.scrollLeft;
         let tY = _svContainer.scrollTop;
         let go = false;
-        if (relX < padX || relX > viewW - padX) { tX = left  - viewW / 2; go = true; }
-        if (relY < padY || relY > viewH - padY) { tY = topPx - viewH / 2; go = true; }
+
+        // Horizontal scroll: keep marker within the padX zone (unchanged).
+        if (relX < padX || relX > viewW - padX) { tX = left - viewW / 2; go = true; }
+
+        // Vertical scroll: page layout only (horizontal layout is one long row).
+        if (!_svLayoutIsHoriz) {
+            // Locate the next staff system after the current beat's row, so we
+            // can scroll to keep at least one row of lookahead visible.
+            let nextSysBottom = -1;
+            try {
+                const systems = bl.staffSystems || [];
+                let foundCurrent = false;
+                for (const sys of systems) {
+                    const svb = sys && sys.visualBounds;
+                    if (!svb) continue;
+                    if (foundCurrent) {
+                        nextSysBottom = baseY + svb.y + svb.h;
+                        break;
+                    }
+                    if (bvb.y >= svb.y && bvb.y < svb.y + svb.h) foundCurrent = true;
+                }
+            } catch (_) {}
+
+            const topEdge = Math.round(viewH * 0.15); // ~15% from top
+            if (relY < topEdge) {
+                // Marker near viewport top (e.g. backward seek): scroll up so
+                // the current row sits at the 15% inset.
+                tY = Math.max(0, topPx - topEdge);
+                go = true;
+            } else if (nextSysBottom > 0 &&
+                       nextSysBottom > _svContainer.scrollTop + viewH) {
+                // Next system's bottom is below the viewport: scroll to reveal
+                // it while keeping the current row near the top (25% inset).
+                tY = Math.max(0, topPx - Math.round(viewH * 0.25));
+                go = true;
+            } else if (nextSysBottom < 0 && relY > viewH - topEdge) {
+                // No next system (last row) and marker near viewport bottom:
+                // center the marker (original fallback).
+                tY = Math.max(0, topPx - Math.round(viewH / 2));
+                go = true;
+            }
+        }
+
         if (go) {
             _svContainer.scrollTo({
                 left: Math.max(0, tX),
