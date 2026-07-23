@@ -91,7 +91,6 @@ const _SV_NOTE_SOL_F = ['DO','REb','RE','MIb','MI','FA','SOLb','SOL','LAb','LA',
 
 const _SV_STORE_SYNTH_INST = 'staffview_synth_inst';
 const _SV_STORE_SYNTH_VOL  = 'staffview_synth_vol';
-const _SV_STORE_PREROLL    = 'staffview_preroll';
 const _SV_STORE_DETECT        = 'staffview_detect';
 const _SV_STORE_CLEAR_ON_SEEK = 'staffview_clear_on_seek';
 const _SV_STORE_METRONOME     = 'staffview_metronome';
@@ -991,6 +990,11 @@ function _buildScore(at, info, measures) {
         mb.timeSignatureNumerator   = lastTs[0];
         mb.timeSignatureDenominator = lastTs[1];
 
+        // Pickup (anacrusis) measure — the notation JSON marks it explicitly;
+        // alphaTab then sizes the bar by its content instead of the declared
+        // time signature.
+        if (mi === 0 && meas.pickup) mb.isAnacrusis = true;
+
         // Push tempo on the first measure unconditionally (so score.tempo
         // is always readable) and on any measure that changes tempo.
         if (meas.tempo != null) { lastTempo = meas.tempo; }
@@ -1301,16 +1305,9 @@ function createFactory() {
     let _svStudyGateIdx      = 0;      // index of the current gate
     const _svStudyChordHit   = new Set();   // noteKeys satisfied at the current gate
     let _svStudyBtnEl        = null;
-    let _svStudyCountingDown = false;
-    let _svStudyCountdownId  = null;
     let _svStudyAudioCtx     = null;   // metronome beeps; closed on teardown
     let _svStudySeekHandler  = null;   // 'seeked' listener for platform seeks
     const _svStudyWrongAttempts = new Map();   // gateIdx → Set<wrongMidi>
-
-    // ── Global preroll ──────────────────────────────────────────────
-    let _svPrerollEnabled  = _svReadStore(_SV_STORE_PREROLL) !== 'false';
-    let _svPrerollResuming = false;   // true when audio.play() was our own call
-    let _svWasAudioPaused  = null;    // null = unobserved; tracks pause→play edges
 
     // ── Miss-dot overlay ───────────────────────────────────────────
     // A persistent canvas (below the playback marker's z-index) sweeps
@@ -2410,8 +2407,8 @@ function createFactory() {
         ndSection.appendChild(clearRow);
 
         // ── METRONOME section ───────────────────────────────────────
-        // Beat click during normal playback (study mode has its own preroll
-        // clicks, so this stays off there regardless of the toggle).
+        // Beat click during normal playback (off in study mode — the gate
+        // pauses would make the clicks stutter).
         const metroSection = document.createElement('div');
         metroSection.style.cssText =
             'margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px';
@@ -2757,25 +2754,6 @@ function createFactory() {
         studySection.appendChild(studyLabel);
         studySection.appendChild(studyRow);
         studySection.appendChild(studyDesc);
-
-        // Preroll count-in toggle (persisted).
-        const prerollRow = document.createElement('label');
-        prerollRow.className = 'section-practice-controls-row';
-        prerollRow.style.cssText = 'margin-top:6px;align-items:center;gap:6px;cursor:pointer';
-        const prerollChk = document.createElement('input');
-        prerollChk.type    = 'checkbox';
-        prerollChk.checked = _svPrerollEnabled;
-        prerollChk.addEventListener('change', () => {
-            _svPrerollEnabled = prerollChk.checked;
-            _svSaveStore(_SV_STORE_PREROLL, String(_svPrerollEnabled));
-        });
-        const prerollText = document.createElement('span');
-        prerollText.className = 'section-practice-label';
-        prerollText.textContent = 'Preroll count-in';
-        prerollText.style.cssText = 'font-size:10px;opacity:0.7';
-        prerollRow.appendChild(prerollChk);
-        prerollRow.appendChild(prerollText);
-        studySection.appendChild(prerollRow);
 
         // Section order mirrors the legacy pill:
         // NOTE DETECTION → METRONOME → STUDY → HAND → MIDI (+ Sound + Volume) → LAYOUT → ZOOM.
@@ -3371,8 +3349,8 @@ function createFactory() {
 
     // ── Metronome click (normal playback only) ──────────────────────
     // Reuses _svStudyBeep (own lazily-recreated AudioContext) instead of
-    // opening a second audio path. Study mode has its own preroll clicks,
-    // so this stays silent there regardless of the toggle. Same binary-
+    // opening a second audio path. Stays silent in study mode regardless of
+    // the toggle (gate pauses would make it stutter). Same binary-
     // search-over-bundle.beats pattern as _svSyncCursor; _svMetroBeatIdx
     // tracks the last index a click fired for. A platform seek (even an
     // exact +1 beat) sets _svMetroSeekResync via _svMetroAttachSeekHandler,
@@ -3398,7 +3376,13 @@ function createFactory() {
 
         if (_svMetroSeekResync) { _svMetroSeekResync = false; _svMetroBeatIdx = i; return; }
         if (i === _svMetroBeatIdx) return;
-        if (i === _svMetroBeatIdx + 1) _svStudyBeep(beats[i].measure >= 0);
+        if (i === _svMetroBeatIdx + 1) {
+            // Accent downbeats — except a pickup's start: it is really the
+            // tail of an incomplete bar, so the first accent belongs to the
+            // first full measure.
+            const pickup = _svMeasures.length > 0 && !!_svMeasures[0].pickup;
+            _svStudyBeep(beats[i].measure >= 0 && !(i === 0 && pickup));
+        }
         _svMetroBeatIdx = i;
     }
 
@@ -3515,14 +3499,6 @@ function createFactory() {
             _svIsFocused = false;
             _svReleaseAllHeld();
             if (_svActiveInst === instance) _svActiveInst = null;   // eslint-disable-line no-use-before-define
-            // The study preroll/gate-pause block in draw() is gated on
-            // _svIsFocused, so this instance's _svWasAudioPaused freezes while
-            // unfocused. If the shared audio's play state actually changes
-            // meanwhile, the stale value can misread as a pause→play edge on
-            // refocus and fire a false preroll mid-playback. Null it so the
-            // first refocused frame just re-observes current state (same as
-            // the "first observation only" branch in draw()).
-            _svWasAudioPaused = null;
         }
     }
 
@@ -4104,15 +4080,13 @@ function createFactory() {
         _svStudyChordHit.clear();
         _svStudyGateIdx++;
         _svStudySnapCursor();
-        _svPrerollResuming = true;   // gate advance — no preroll on resume
         try {
             const audio = document.getElementById('audio');
             if (audio && audio.paused) {
-                // play() can reject (autoplay policy / decode) — the sync
-                // try/catch won't catch a promise rejection, which would leave
-                // _svPrerollResuming stuck true. Reset it on rejection.
+                // play() can reject (autoplay policy / decode) — swallow it,
+                // the user just presses play again.
                 const p = audio.play();
-                if (p && typeof p.catch === 'function') p.catch(() => { _svPrerollResuming = false; });
+                if (p && typeof p.catch === 'function') p.catch(() => {});
             }
         } catch (_) {}
     }
@@ -4141,7 +4115,6 @@ function createFactory() {
     }
 
     function _svStudyHandleNoteOn(midi) {
-        if (_svStudyCountingDown) return;
         if (_svStudyGateIdx >= _svStudyGates.length) return;
         const entries = _svStudyGetBeatEntries();
         const hit = _svStudyMarkGateHit(entries, _svStudyChordHit, midi);
@@ -4194,8 +4167,7 @@ function createFactory() {
         _svMetroBtnEl.style.boxShadow = _svMetronomeOn ? '0 0 0 1px #22c55e' : '';
     }
 
-    // A short metronome click for the preroll countdown (own AudioContext,
-    // closed on teardown).
+    // A short metronome click (own AudioContext, closed on teardown).
     function _svStudyBeep(accent) {
         try {
             const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -4215,31 +4187,6 @@ function createFactory() {
             osc.start(ctx.currentTime);
             osc.stop(ctx.currentTime + 0.06);
         } catch (_) {}
-    }
-
-    // One-bar count-in before playback resumes (study + preroll enabled).
-    function _svStudyStartCountdown(onDone) {
-        const score       = _svApi && _svApi.score;
-        const bpm         = (score && score.tempo) ? score.tempo : 120;
-        const mb          = score && score.masterBars && score.masterBars.length
-                            ? score.masterBars[0] : null;
-        const beatsPerBar = mb ? (mb.timeSignatureNumerator || 4) : 4;
-        const beatMs      = (60 / bpm) * 1000;
-        _svStudyCountingDown = true;
-        let beatIdx = 0;
-        _svStudyBeep(true);   // beat 1 — accent
-        beatIdx++;
-        _svStudyCountdownId = setInterval(() => {
-            if (beatIdx < beatsPerBar) {
-                _svStudyBeep(false);
-                beatIdx++;
-            } else {
-                clearInterval(_svStudyCountdownId);
-                _svStudyCountdownId  = null;
-                _svStudyCountingDown = false;
-                onDone();
-            }
-        }, beatMs);
     }
 
     // Re-home the gate to time `t` and clear per-gate progress. Shared by the
@@ -4292,11 +4239,6 @@ function createFactory() {
     }
 
     function _svStudyDeactivate() {
-        if (_svStudyCountdownId !== null) {
-            clearInterval(_svStudyCountdownId);
-            _svStudyCountdownId  = null;
-            _svStudyCountingDown = false;
-        }
         _svStudyDetachSeekHandler();
         _svStudyMode     = false;
         _svStudyChordHit.clear();
@@ -4395,22 +4337,15 @@ function createFactory() {
         // Notation is going away — restore core's HUD to the top bar (no-op if
         // this instance wasn't the one showing notation).
         _svSetNotationShowing(instance, false);
-        // Tear down study mode: stop any countdown, detach the seek listener,
-        // reset gate state, and close the metronome AudioContext (hardware).
-        if (_svStudyCountdownId !== null) {
-            clearInterval(_svStudyCountdownId);
-            _svStudyCountdownId  = null;
-        }
+        // Tear down study mode: detach the seek listener, reset gate state,
+        // and close the metronome AudioContext (hardware).
         _svStudyDetachSeekHandler();
         _svSetStudyActive(instance, false);   // restore core's HUD if torn down mid-study
         _svStudyMode         = false;
-        _svStudyCountingDown = false;
         _svStudyGates        = [];
         _svStudyGateIdx      = 0;
         _svStudyChordHit.clear();
         _svStudyWrongAttempts.clear();
-        _svPrerollResuming   = false;
-        _svWasAudioPaused    = null;
         if (_svStudyAudioCtx) {
             try { _svStudyAudioCtx.close(); } catch (_) {}
             _svStudyAudioCtx = null;
@@ -4587,39 +4522,19 @@ function createFactory() {
             _svMetroTick(bundle.currentTime);
             _svSweepMisses(bundle.currentTime);
 
-            // Study mode: preroll count-in on manual play, and gate-pause when
-            // the OGG reaches the next required note.
+            // Study mode: gate-pause when the OGG reaches the next required
+            // note. (Count-in is core's job — countdownBeforeSong.)
             try {
                 // Shared #audio element is driven from every instance's draw()
                 // loop; in split-screen, gate on focus so panels don't fight
                 // over the one track.
                 const audio = document.getElementById('audio');
                 if (audio && _svIsFocused) {
-                    const nowPaused = audio.paused;
-                    if (_svWasAudioPaused === null) {
-                        _svWasAudioPaused = nowPaused;   // first observation only
-                    } else if (!nowPaused && _svWasAudioPaused) {
-                        // paused → playing: if the user pressed play, do a preroll.
-                        if (_svStudyMode && _svPrerollEnabled
-                                && !_svPrerollResuming && !_svStudyCountingDown) {
-                            audio.pause();
-                            _svStudyStartCountdown(() => {
-                                _svPrerollResuming = true;
-                                // Same play()-rejection guard as _svStudyAdvance.
-                                try {
-                                    const p = audio.play();
-                                    if (p && typeof p.catch === 'function') p.catch(() => { _svPrerollResuming = false; });
-                                } catch (_) {}
-                            });
-                        }
-                        _svPrerollResuming = false;
-                    }
                     const _g = _svStudyGates[_svStudyGateIdx];
-                    if (_svStudyMode && !_svStudyCountingDown && !audio.paused
+                    if (_svStudyMode && !audio.paused
                             && _g && audio.currentTime >= _g.gateTime) {
                         audio.pause();
                     }
-                    _svWasAudioPaused = audio.paused;
                 }
             } catch (_) {}
         },
